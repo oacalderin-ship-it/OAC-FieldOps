@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#14181c"/>
+  <path d="M11 45V20h4l8 15V20h5v25h-4l-8-15v15z" fill="#f2f4f6" opacity="0"/>
+  <text x="7" y="43" font-family="Arial,sans-serif" font-size="25" font-weight="900" letter-spacing="-2" fill="#f5f6f8">OAC</text>
+  <circle cx="55" cy="48" r="4" fill="#ff8336"/>
+</svg>

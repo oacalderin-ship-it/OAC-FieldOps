@@ -1,0 +1,21 @@
+name: Verify OAC FieldOps
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  check-fieldops:
+    name: check-fieldops
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Validate JavaScript syntax
+        run: node --check app.js
+      - name: Run local security smoke checks
+        run: node tests/security-smoke.cjs
