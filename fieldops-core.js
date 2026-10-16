@@ -1,0 +1,1442 @@
+/* OAC FieldOps • browser-only, encrypted workspace. No external dependencies or telemetry. */
+'use strict';
+const STORE='oac.fieldops.v1', ITERATIONS=310000, VERSION=1;
+const enc=new TextEncoder(), dec=new TextDecoder();
+const PHASES=[
+ {name:'Reconnaissance',short:'Recon',summary:'Prove you have authorization; identify the network and collect initial Shark Jack evidence.',checks:[['scope','Written permission and exact testing scope recorded'],['network','Network connection and addressing verified'],['payload','Authorized Shark Jack payload(s) run and logged'],['inventory','Discovery results transferred or documented']]},
+ {name:'Enumeration',short:'Enumerate',summary:'Turn raw output into a reliable list of devices, ports, services, and versions.',checks:[['import','Shark Jack/Nmap loot imported'],['identify','Discovered hosts and service versions reviewed'],['tools','Target-specific enumeration selected from findings'],['baseline','A clean baseline scan retained as evidence']]},
+ {name:'Vulnerability assessment',short:'Vuln scans',summary:'Test hypotheses carefully. An open port is not automatically a vulnerability.',checks:[['select','Non-destructive scans selected for in-scope services'],['verify','Potential weaknesses manually validated'],['severity','Findings assigned defensible severity and status'],['evidence','Proof and remediation notes recorded']]},
+ {name:'Exploitation',short:'Exploit',summary:'Use only specifically permitted proof-of-concept tests; stop when impact is demonstrated.',checks:[['approved','Exploitation expressly authorized for the chosen target'],['plan','Test objective, method, stop conditions and rollback defined'],['poc','Minimal controlled proof performed or marked not attempted'],['outcome','Result and objective evidence captured']]},
+ {name:'Post-exploitation',short:'Post-exploit',summary:'Determine actual impact with minimal access, avoid collecting unrelated private data, and clean up.',checks:[['privileges','Effective access level or limitations documented'],['impact','Business/security impact safely established'],['cleanup','Sessions, test artifacts and changes accounted for'],['restrictions','No unauthorized persistence or lateral movement occurred']]},
+ {name:'Reporting',short:'Report',summary:'Produce a defensible summary with reproducible evidence, impact, and priorities.',checks:[['dedupe','Findings deduplicated and false positives marked'],['review','Executive summary and assessment limitations written'],['fixes','Remediation guidance and severity reviewed'],['export','Client-ready report exported and secure backup retained']]}
+];
+const PAYLOADS=[
+ {name:'Simple Connection Test',type:'Connectivity',risk:'Very low',purpose:'Confirm link, DHCP/default route, and basic internet reachability before scanning.',expect:'IP address, subnet mask, gateway, DNS, success/failure.',next:'If this fails, correct cabling, NETMODE, DHCP, or uplink before doing port scans.'},
+ {name:'Advanced Ping Test',type:'Reachability',risk:'Very low',purpose:'Test specific authorized hosts (such as your router) instead of assuming that a device is alive.',expect:'Target, packet-loss, response or time-out.',next:'If ping fails, do not assume host is offline; ICMP might be blocked.'},
+ {name:'Network Discovery / ARP',type:'Host discovery',risk:'Low',purpose:'Inventory visible machines on the connected LAN segment using an installed discovery payload.',expect:'Hosts, addresses, MACs and timestamps (if available).',next:'Import results; verify against your permitted IP range.'},
+ {name:'Port Scan / Nmap',type:'Enumeration',risk:'Low–moderate',purpose:'Identify listening TCP ports on a known in-scope target using an appropriate built-in or vetted payload.',expect:'Host, port, protocol, state, service, output file.',next:'Import the output; select an asset to receive service-specific next steps.'}
+];
+const RULES=[
+ {id:'http',ports:[80,8080,8000,8008,8888],label:'Web service (HTTP)',tools:'curl, WhatWeb, browser, Nikto (only if permitted)',why:'Identify the application, headers, redirects and exposed web surface before deciding which tests apply.',cmd:(t,ports)=>[{name:'Inspect response headers',text:`curl -I --max-time 10 http://${t}${ports==='80'?'':':'+ports.split(', ')[0]}/`,why:'Read HTTP response headers without attempting access control bypass.'},{name:'Fingerprint the web stack',text:`whatweb http://${t}${ports==='80'?'':':'+ports.split(', ')[0]}/`,why:'Collect technology hints; fingerprinting alone does not prove a flaw.'}]},
+ {id:'https',ports:[443,8443,9443],label:'Encrypted web service (HTTPS)',tools:'curl, WhatWeb, Nmap TLS scripts',why:'Check HTTPS technology, TLS configuration, and application exposure.',cmd:(t,ports)=>[{name:'Inspect HTTPS response',text:`curl -k -I --max-time 10 https://${t}${ports==='443'?'':':'+ports.split(', ')[0]}/`,why:'-k lets you inspect a self-signed lab certificate; never treat it as validation of trust.'},{name:'Inspect supported TLS ciphers',text:`nmap -Pn -p ${ports} --script ssl-enum-ciphers ${t}`,why:'May make multiple TLS handshakes. Check approval and exact port.'}]},
+ {id:'ssh',ports:[22],label:'SSH management',tools:'Nmap, ssh-keyscan, searchsploit',why:'Determine whether remote administration is expected and inspect version/authentication configuration.',cmd:t=>[{name:'Fingerprint SSH',text:`nmap -Pn -sV --version-light -p 22 ${t}`,why:'Use identified product/version for subsequent advisory research; never guess based on the port name.'},{name:'Read public SSH host key',text:`ssh-keyscan -T 5 ${t}`,why:'Collect public host-key details without attempting a login.'}]},
+ {id:'smb',ports:[139,445],label:'Windows file-sharing / SMB',tools:'Nmap SMB scripts, smbclient (approved)',why:'Check SMB dialect and security mode; exposed SMB does not imply anonymous share access.',cmd:(t,ports)=>[{name:'SMB protocol & signing discovery',text:ports.includes('445')?`nmap -Pn -p 445 --script smb-protocols,smb2-security-mode ${t}`:`nmap -Pn -sV -p ${ports} ${t}`,why:'Checks commonly relevant SMB protocol/security properties without trying credentials.'}]},
+ {id:'rdp',ports:[3389],label:'Remote Desktop / RDP',tools:'Nmap, Windows configuration review',why:'Check whether remote desktop is intended, restricted, and using an appropriate security configuration.',cmd:t=>[{name:'Fingerprint RDP',text:`nmap -Pn -sV -p 3389 ${t}`,why:'Confirm the exposed service before reviewing policy and vulnerability advisories.'}]},
+ {id:'dns',ports:[53],label:'DNS service',tools:'dig, Nmap',why:'Identify whether this is an authoritative resolver or general-purpose recursive DNS server.',cmd:t=>[{name:'Inspect DNS service',text:`nmap -Pn -sV -p 53 ${t}`,why:'Determine the service version if advertised; verify role with the asset owner.'}]},
+ {id:'ad',ports:[88,389,636,3268,3269],label:'Directory / Active Directory',tools:'Nmap, LDAP tooling with test account',why:'Directory services are often normal on domain controllers. Verify intended exposure and secure binding.',cmd:(t,ports)=>[{name:'Check directory service exposure',text:`nmap -Pn -sV -p ${ports} ${t}`,why:'Only identifies exposed ports and advertised service information.'}]},
+ {id:'db',ports:[1433,1521,3306,5432,6379,27017],label:'Database / data store',tools:'Nmap, vendor client with approved test account',why:'Determine whether the database needs to be reachable from this subnet; inspect configuration with permission.',cmd:(t,ports)=>[{name:'Confirm data-service ports',text:`nmap -Pn -sV -p ${ports} ${t}`,why:'Discovery only. Do not attempt unauthorized logins or dump database records.'}]},
+ {id:'snmp',ports:[161],label:'SNMP management',tools:'Nmap, approved SNMP client',why:'Management telemetry should be restricted and appropriately authenticated.',cmd:t=>[{name:'Check SNMP service',text:`nmap -sU -Pn -p 161 --version-light ${t}`,why:'UDP probing can be slow; permission and rate limits still apply.'}]}
+];
+let vault=null, derivedKey=null, vaultSalt=null;
+let ui={phase:0,assetId:'',modal:'',editId:'',toast:'',query:'',filter:'all',busy:false,notesOpen:false};
+const $=s=>document.querySelector(s);
+const e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const id=()=>crypto.randomUUID?.() || (Date.now().toString(36)+Math.random().toString(36).slice(2));
+const today=()=>new Date().toISOString().slice(0,10);
+const time=()=>new Date().toISOString();
+const date=s=>s?new Date(s).toLocaleString(): '—';
+const b64=u=>{const bytes=new Uint8Array(u);let str='';for(let i=0;i<bytes.length;i+=16384)str+=String.fromCharCode(...bytes.subarray(i,i+16384));return btoa(str)};
+const un64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const makeEngagement=(name='Home Lab Practice')=>({id:id(),name,client:'Personal / authorized lab',operator:'',scope:'10.10.20.0/24',kind:'lab',authorized:false,exploitApproved:false,permissionBy:'',rules:'No DoS, no persistence, no real credentials, no unnecessary personal data.',started:today(),ended:'',checks:{},assets:[],runs:[],sources:[],findings:[],tests:[],postNotes:'',summary:'',limitations:'',recommendations:'',activity:[]});
+const current=()=>vault?.engagements?.find(x=>x.id===vault.activeId)||vault?.engagements?.[0];
+const log=(p,event)=>{p.activity.unshift({id:id(),at:time(),text:event});p.activity=p.activity.slice(0,150)};
+const done=(p,phase)=>PHASES[phase].checks.filter(([k])=>p.checks?.[`${phase}:${k}`]).length;
+const phasePercent=(p,phase)=>Math.round(100*done(p,phase)/PHASES[phase].checks.length);
+const allPercent=p=>Math.round(100*PHASES.reduce((sum,_,i)=>sum+done(p,i),0)/PHASES.reduce((sum,q)=>sum+q.checks.length,0));
+const allPorts=p=>p.assets.reduce((n,a)=>n+a.ports.length,0);
+const numberRisk=(p,key)=>p.findings.filter(f=>f.severity===key && f.status!=='disproved').length;
+const severityCls=s=>['critical','high','medium','low','info'].includes(s)?s:'info';
+const validIPv4=s=>{const bits=s.split('.');return bits.length===4&&bits.every(x=>/^\d{1,3}$/.test(x)&&Number(x)<=255)};
+const validTarget=s=>validIPv4(s)||/^(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+$/.test(s);
+const validScope=s=>{const m=s.trim().match(/^([^/]+)(?:\/(\d{1,2}))?$/);return !!m&&(validIPv4(m[1])&&(!m[2]||+m[2]<=32));};
+const scopeSafety=p=>p.authorized&&validScope(p.scope);
+const targetText=(a)=>a && validTarget(a.host)?a.host:'TARGET_IP';
+function message(text){ui.toast=text;render();setTimeout(()=>{ui.toast='';const t=$('#oac-toast');if(t)t.remove()},3600)}
+function fail(err){console.error('FieldOps:',err);message('Could not complete action: '+(err?.message||'unknown error'))}
+async function makeKey(password,salt){const base=await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']);return crypto.subtle.deriveKey({name:'PBKDF2',salt,iterations:ITERATIONS,hash:'SHA-256'},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt'])}
+async function persist(){if(!vault||!derivedKey)throw new Error('Workspace locked');const iv=crypto.getRandomValues(new Uint8Array(12));const blob=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:enc.encode('OAC-FIELDOPS-V1')},derivedKey,enc.encode(JSON.stringify(vault)));localStorage.setItem(STORE,JSON.stringify({version:VERSION,salt:vaultSalt,iv:b64(iv),data:b64(blob)}))}
+async function commit(summary){if(summary)log(current(),summary);await persist();render()}
+async function createVault(pass){vaultSalt=b64(crypto.getRandomValues(new Uint8Array(16)));derivedKey=await makeKey(pass,un64(vaultSalt));const p=makeEngagement();vault={version:1,engagements:[p],activeId:p.id,created:time()};await persist();render()}
+async function unlock(pass){const raw=localStorage.getItem(STORE);if(!raw)throw Error('No local vault found');let box=JSON.parse(raw);if(box.version!==1)throw Error('Unsupported vault format');const key=await makeKey(pass,un64(box.salt));const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:un64(box.iv),additionalData:enc.encode('OAC-FIELDOPS-V1')},key,un64(box.data));let data=JSON.parse(dec.decode(plain));if(!Array.isArray(data.engagements))throw Error('Invalid workspace');derivedKey=key;vaultSalt=box.salt;vault=data;ui={...ui,phase:0,assetId:'',modal:''};render()}
+function lock(){vault=null;derivedKey=null;vaultSalt=null;ui={phase:0,assetId:'',modal:'',editId:'',toast:'',query:'',filter:'all'};render()}
+function resetVault(){localStorage.removeItem(STORE);lock()}
+function saveBlob(name,body,mime){const url=URL.createObjectURL(new Blob([body],{type:mime}));const a=document.createElement('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)}
+function stamp(){return today()}
+const fname=s=>(s||'engagement').toLowerCase().replace(/[^a-z0-9-]+/g,'-').slice(0,50);
+function reportPlain(p){return `# ${p.name} — Penetration Test Report\n\nDate: ${today()}\nClient: ${p.client}\nAssessor: ${p.operator||'Not specified'}\nScope: ${p.scope}\nAuthorized: ${p.authorized?'Recorded':'NOT RECORDED'}\nExploitation approved: ${p.exploitApproved?'Yes':'No'}\n\n## Executive summary\n${p.summary||'No executive summary provided.'}\n\n## Methodology\n1. Reconnaissance; 2. Enumeration; 3. Vulnerability assessment; 4. Exploitation (if expressly approved); 5. Post-exploitation; 6. Reporting.\n\n## Limitations\n${p.limitations||'None recorded.'}\n\n## Assets\n${p.assets.map(a=>`- ${a.host}${a.hostname?' ('+a.hostname+')':''}: ${a.ports.map(k=>`${k.port}/${k.protocol} ${k.service}`).join(', ')||'No services recorded'}`).join('\n')||'No assets entered.'}\n\n## Findings\n${p.findings.map((f,i)=>`### ${i+1}. [${f.severity.toUpperCase()}] ${f.title}\nHost: ${f.host}\nValidation: ${f.status}\nEvidence: ${f.evidence||'Not entered'}\nImpact: ${f.impact||'Not entered'}\nRemediation: ${f.remediation||'Not entered'}\n`).join('\n')||'No findings recorded.'}\n\n## Controlled exploitation log\n${p.tests.map(t=>`- ${t.host} | ${t.result} | ${t.objective}\n  Method: ${t.method}\n  Evidence: ${t.evidence}\n  Cleanup: ${t.cleanup}`).join('\n')||'No exploitation tests recorded.'}\n\n## Post-exploitation notes\n${p.postNotes||'None recorded.'}\n\n## Recommendations\n${p.recommendations||'Review findings and prioritize validated, high-impact exposures.'}\n\n## Evidence register (hashes)\n${p.sources.map(s=>`- ${s.name} | SHA-256 ${s.sha} | imported ${s.at}`).join('\n')||'No file imports.'}\n\nGenerated locally with OAC FieldOps. Operator must independently verify technical claims.`}
+function reportHTML(p){const f=p.findings.filter(q=>q.status!=='disproved');return `<div class="report-sheet"><div style="color:#bb5d20;font-size:11px;font-weight:800;letter-spacing:2px">OAC // FIELDOPS</div><h2>${e(p.name)}</h2><p class="muted">Penetration testing report • ${e(today())}</p><table><tr><th>Client</th><td>${e(p.client)}</td><th>Assessor</th><td>${e(p.operator||'—')}</td></tr><tr><th>Scope</th><td>${e(p.scope)}</td><th>Assessment</th><td>${e(p.kind)}</td></tr><tr><th>Authorization</th><td>${p.authorized?'Recorded':'NOT RECORDED'}</td><th>Exploit approval</th><td>${p.exploitApproved?'Yes':'No'}</td></tr></table><h3>Executive summary</h3><p>${e(p.summary||'Executive summary not yet completed.')}</p><h3>Scope & methodology</h3><p>Scoped discovery → service enumeration → vulnerability assessment → approved minimal exploitation → impact verification and cleanup → reporting.</p><p><strong>Limitations:</strong> ${e(p.limitations||'Not specified.')}</p><h3>Assessment at a glance</h3><table><tr><th>Assets</th><th>Services</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th></tr><tr><td>${p.assets.length}</td><td>${allPorts(p)}</td><td>${numberRisk(p,'critical')}</td><td>${numberRisk(p,'high')}</td><td>${numberRisk(p,'medium')}</td><td>${numberRisk(p,'low')}</td></tr></table><h3>Asset inventory</h3><table><tr><th>Asset</th><th>Observed services</th></tr>${p.assets.map(a=>`<tr><td>${e(a.host)} ${e(a.hostname)}</td><td>${e(a.ports.map(q=>q.port+'/'+q.protocol+' '+q.service+(q.version?' ('+q.version+')':'')).join('; ')||'None recorded')}</td></tr>`).join('')||'<tr><td colspan="2">No assets</td></tr>'}</table><h3>Findings</h3>${f.map((x,i)=>`<div style="break-inside:avoid;margin:16px 0"><strong>${i+1}. ${e(x.title)} [${e(x.severity.toUpperCase())}]</strong><p><strong>Target:</strong> ${e(x.host)} | <strong>Status:</strong> ${e(x.status)}</p><p><strong>Evidence:</strong> ${e(x.evidence||'Not recorded')}</p><p><strong>Impact:</strong> ${e(x.impact||'Not assessed')}</p><p><strong>Recommended fix:</strong> ${e(x.remediation||'Not recorded')}</p></div>`).join('')||'<p>No validated or suspected findings recorded.</p>'}<h3>Controlled exploitation results</h3>${p.tests.map(t=>`<p><strong>${e(t.host)} — ${e(t.result)}</strong><br>Objective: ${e(t.objective)}<br>Method: ${e(t.method)}<br>Proof: ${e(t.evidence)}<br>Cleanup: ${e(t.cleanup)}</p>`).join('')||'<p>No tests recorded.</p>'}<h3>Post-exploitation assessment</h3><p>${e(p.postNotes||'Not performed or not documented.')}</p><h3>Remediation priorities</h3><p>${e(p.recommendations||'Prioritize confirmed weaknesses by likely impact and exposure.')}</p><h3>Evidence manifest (SHA-256)</h3><table><tr><th>File</th><th>SHA-256</th></tr>${p.sources.map(s=>`<tr><td>${e(s.name)}</td><td style="overflow-wrap:anywhere">${e(s.sha)}</td></tr>`).join('')||'<tr><td colspan="2">No imports</td></tr>'}</table><p style="margin-top:24px;color:#64707a;font-size:10px">Generated locally by OAC FieldOps. This is a practitioner-authored report, not an automatic certification of security, legal authorization or proof integrity.</p></div>`}
+function exportHTML(p){const doc=`<!doctype html><html lang="en"><meta charset="utf-8"><title>${e(p.name)} – Pentest Report</title><style>body{font-family:Arial,sans-serif;max-width:950px;margin:40px auto;color:#21272c;line-height:1.6;padding:0 20px}.report-sheet{font-size:13px}h2{font-size:29px;margin:5px 0}h3{border-bottom:1px solid #aeb8bf;padding:8px 0}table{border-collapse:collapse;width:100%;margin:14px 0}td,th{padding:8px;border-bottom:1px solid #d5dce0;text-align:left;vertical-align:top}p{white-space:pre-wrap}@media print{body{margin:0;padding:0}@page{margin:18mm}}</style>${reportHTML(p)}</html>`;saveBlob(fname(p.name)+'-report.html',doc,'text/html;charset=utf-8')}
+function stats(p){return [{v:p.assets.length,l:'Discovered assets',h:'Verified inventory'},{v:allPorts(p),l:'Observed services',h:'From imports + manual entry'},{v:p.findings.length,l:'Findings',h:'Suspected + confirmed + dismissed'},{v:allPercent(p)+'%',l:'Workflow complete',h:'Checklist progress'}]}
+function authPage(){const exists=!!localStorage.getItem(STORE);return `<div class="auth-wrap"><div class="auth-hero"><div class="brand-mark" style="font-size:44px">OAC<b>.</b> <span style="font-size:16px;color:#8a949d;letter-spacing:2px">FIELDOPS</span></div><div class="eyebrow" style="margin-top:27px">TACTICAL WORKFLOW / PRIVATE BY DESIGN</div><h1>From first scan<br>to <span class="accent">final finding.</span></h1><p class="lead" style="font-size:16px">Your guided Shark Jack + Kali workbench. Track loot, discover services, choose smarter tests and build a professional pentest report.</p><div class="auth-points"><div class="auth-point"><span>01</span> Six guided phases with built-in checklists and clear explanations</div><div class="auth-point"><span>02</span> Findings-driven recommendations for your actual open ports</div><div class="auth-point"><span>03</span> AES-GCM encrypted local vault. No account, database, ads, or telemetry</div></div></div><div class="auth-card"><div class="eyebrow">${exists?'VAULT / UNLOCK':'VAULT / FIRST-TIME SETUP'}</div><h2 style="margin-top:9px">${exists?'Unlock your workspace':'Create your secure workspace'}</h2><p>${exists?'Enter the same passphrase used to encrypt this browser’s data.':'Choose a strong passphrase. It encrypts your assessments on this device before they are saved.'}</p><form id="auth-form" class="auth-grid"><div class="field"><label for="pass">Workspace passphrase</label><input id="pass" name="pass" type="password" autocomplete="${exists?'current-password':'new-password'}" minlength="10" required placeholder="Enter passphrase" /></div>${exists?'':`<div class="field"><label for="confirm">Confirm passphrase</label><input id="confirm" name="confirm" type="password" autocomplete="new-password" minlength="10" required placeholder="Repeat passphrase" /></div>`}<button type="submit" class="btn primary" style="width:100%;margin-top:5px">${exists?'Unlock FieldOps →':'Create encrypted workspace →'}</button></form><div class="callout ${exists?'info':'warn'}" style="margin-top:19px">${exists?'Your data exists only in this browser profile unless you previously exported an encrypted backup.':'No password recovery or cloud sync. Save an encrypted backup and keep your passphrase safe. Never upload real pentest data into a public GitHub repo.'}</div>${exists?`<div class="actions-row"><button class="btn small-btn ghost" data-action="import-backup-picker">Restore encrypted backup instead</button><input id="restore-backup" type="file" accept="application/json,.json" hidden><button class="btn small-btn ghost" data-action="show-reset">Reset this browser’s workspace</button></div>`:''}<p class="tiny" style="margin:16px 0 0">Best used over HTTPS (GitHub Pages). No data leaves this page.</p></div></div>`}
+function hero(p){const ph=PHASES[ui.phase];return `<div class="hero"><div class="eyebrow">PHASE 0${ui.phase+1} / 0${PHASES.length} &nbsp; • &nbsp; ${e(p.name)}</div><h1 class="heading">${e(ph.name)}<span class="accent">.</span></h1><p class="lead">${e(ph.summary)}</p><div class="hero-foot"><span class="tag ${p.authorized?'green':'red'}">${p.authorized?'✓ SCOPE RECORDED':'! SCOPE NOT CONFIRMED'}</span><span class="tag muted">${e(p.scope)}</span><span class="small">${done(p,ui.phase)} of ${ph.checks.length} tasks complete</span></div></div>`}
+function metrics(p){return `<section class="metrics">${stats(p).map(s=>`<div class="metric"><div class="label">${e(s.l)}</div><div class="number">${e(s.v)}</div><div class="hint">${e(s.h)}</div></div>`).join('')}</section>`}
+function checklist(p){const ph=PHASES[ui.phase];return `<section class="panel"><div class="panel-header"><div><h2 class="panel-title">Phase checklist</h2><p class="panel-desc">Mark each task only after it is genuinely complete.</p></div><span class="tag muted">${phasePercent(p,ui.phase)}%</span></div><div class="item-list">${ph.checks.map(([key,label],i)=>`<label class="step-card check-row" style="margin:0"><input type="checkbox" data-check="${ui.phase}:${key}" ${p.checks[`${ui.phase}:${key}`]?'checked':''}><div class="step-copy"><div class="step-title">${e(label)}</div><div class="step-desc">Checklist item ${i+1} of ${ph.checks.length}</div></div></label>`).join('')}</div><div class="progress"><span style="width:${phasePercent(p,ui.phase)}%"></span></div><div class="progress-label"><span>Your progress is saved in your encrypted workspace.</span><span>${done(p,ui.phase)}/${ph.checks.length}</span></div></section>`}
+function stepAdvice(p){const selected=p.assets.find(x=>x.id===ui.assetId)||p.assets[0];let actions=[
+ !p.authorized?'Confirm your test scope and authorization before running scans.':!p.runs.length?'Run the Shark Jack connection check and log its output.':'Transfer Shark Jack loot and proceed to Enumeration.',
+ !p.sources.length?'Import a Shark Jack text result or Nmap XML file.':!p.assets.length?'Add a host and its observed ports manually.':'Select an asset and inspect each service-specific suggestion.',
+ !p.assets.length?'First identify a real, in-scope service in Enumeration.':!p.findings.length?'Validate one hypothesis and record suspected versus confirmed status.':'Review evidence and adjust severity before testing.',
+ !p.exploitApproved?'Obtain explicit exploitation approval, or record that testing was skipped.':!p.tests.length?'Define and perform one minimal, approved proof-of-concept test.':'Confirm the proof and record how test changes were cleaned up.',
+ !p.tests.length?'Document that exploitation was not performed, if applicable.':!p.postNotes?'Document confirmed access, limitations, and cleanup.':'Move to Reporting and review business impact.',
+ !p.summary?'Write an executive summary understandable by a non-technical client.':'Export the client report and an encrypted workspace backup.'
+];return `<div class="panel tight"><div class="section-kicker">NEXT BEST ACTION</div><h3 class="subheading" style="margin:8px 0 8px">${e(actions[ui.phase])}</h3><p class="small">${ui.phase===1&&selected?'Current asset: '+e(selected.host):'Follow the workflow, not assumptions. A listening port alone does not mean a vulnerability.'}</p><div class="actions-row">${ui.phase<5?`<button class="btn small-btn primary" data-action="next-phase">Next phase →</button>`:'<button class="btn small-btn primary" data-action="print-report">Print / Save PDF</button>'}</div></div>`}
+function notesSide(p){return `<div class="panel tight"><div class="panel-header"><div><h3 class="panel-title">Session activity</h3><p class="panel-desc">Recent changes, locally recorded</p></div></div><div class="item-list">${p.activity.slice(0,6).map(a=>`<div class="item"><div class="small" style="color:#d5dade">${e(a.text)}</div><div class="tiny" style="margin-top:7px">${e(date(a.at))}</div></div>`).join('')||'<div class="empty">No activity recorded yet.</div>'}</div></div>`}
+function shell(p){return `<div class="layout"><aside class="sidebar"><div class="brand"><div class="brand-mark">OAC<b>.</b></div><div class="brand-caption">FIELDOPS<br>SECURITY LAB</div></div><div class="side-label">MISSION WORKFLOW</div><nav class="side-nav" aria-label="Penetration test phases">${PHASES.map((ph,i)=>`<button type="button" class="nav-btn ${ui.phase===i?'active':''}" data-phase="${i}" aria-current="${ui.phase===i?'step':'false'}"><span class="nav-num">0${i+1}</span><span class="nav-main">${e(ph.short)} ${done(p,i)===ph.checks.length?'<span class="nav-check">✓</span>':''}</span></button>`).join('')}</nav><div class="sidebar-bottom"><div class="small"><span class="safe-dot"></span>LOCAL ENCRYPTED VAULT</div><p class="tiny">No data is sent to a server. Your passphrase never leaves this browser session.</p><button class="mini-link" data-action="lock">Lock workspace ↗</button><button class="mini-link" style="margin-top:10px;color:#e0a49c" data-action="show-reset">Reset workspace</button></div></aside><main class="main"><header class="topbar"><div><div class="crumb">OPERATIONS / ${e(PHASES[ui.phase].short.toUpperCase())}</div><div class="tiny" style="margin-top:5px">OAC FIELDOPS / v1.0 • Authenticated local storage</div></div><div class="top-actions"><select class="select-field" id="engagement-select" aria-label="Current engagement">${vault.engagements.map(q=>`<option value="${e(q.id)}" ${q.id===p.id?'selected':''}>${e(q.name)}</option>`).join('')}</select><button class="btn small-btn" data-action="new-engagement">+ Engagement</button><button class="btn small-btn" data-action="export-backup">↧ Backup</button><button class="btn small-btn primary" data-action="print-report">↓ PDF</button></div></header>${hero(p)}${metrics(p)}<div class="content-grid"><div class="stack">${contentForPhase(p)}${checklist(p)}</div><aside class="stack recommend-side">${stepAdvice(p)}${notesSide(p)}<div class="panel tight"><div class="section-kicker">IMPORTANT BOUNDARY</div><p class="small">Run generated commands manually in Kali on systems specifically listed in your authorization. This webpage never scans a network or runs a payload itself.</p><button class="btn ghost small-btn" data-action="export-backup">Save encrypted backup</button></div></aside></div><div class="foot">OAC FIELDOPS • BUILT FOR AUTHORIZED ASSESSMENTS • LOCAL-FIRST</div></main></div>${ui.modal?modal(p):''}${ui.toast?`<div class="toast" role="status" id="oac-toast">${e(ui.toast)}</div>`:''}`}
+function contentForPhase(p){return [recon,enumeration,vulnerability,exploitation,postExploit,report][ui.phase](p)}
+function scopeGate(p){return scopeSafety(p)?`<div class="callout ok"><strong>Authorization gate passed.</strong> Scope is recorded as <code>${e(p.scope)}</code>. Commands must still be reviewed against your engagement's permitted targets.</div>`:`<div class="callout warn"><strong>Scanning commands are locked.</strong> First record authorization and a valid IPv4 target/CIDR in Phase 01. A checkbox alone does not replace written authorization.</div>`}
+function recon(p){return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">SET UP YOUR ENGAGEMENT</div><h2 class="panel-title">Scope & rules of engagement</h2><p class="panel-desc">Define precisely what you have permission to touch.</p></div></div><form id="scope-form"><div class="form-grid"><div class="field"><label>Engagement name</label><input name="name" required maxlength="90" value="${e(p.name)}"></div><div class="field"><label>Client / environment</label><input name="client" maxlength="100" value="${e(p.client)}"></div><div class="field"><label>Your name / assessor</label><input name="operator" maxlength="100" value="${e(p.operator)}" placeholder="Operator name"></div><div class="field"><label>Testing type</label><select name="kind"><option value="lab" ${p.kind==='lab'?'selected':''}>Isolated practice lab</option><option value="owned" ${p.kind==='owned'?'selected':''}>My owned network</option><option value="client" ${p.kind==='client'?'selected':''}>Client-authorized engagement</option></select></div><div class="field"><label>Authorized IPv4 target / CIDR</label><input name="scope" value="${e(p.scope)}" placeholder="10.10.20.0/24" required><span class="field-help">Use one IPv4 address or CIDR. Broad or invalid scope is blocked.</span></div><div class="field"><label>Approval provided by</label><input name="permissionBy" maxlength="100" value="${e(p.permissionBy)}" placeholder="Lab owner / client contact"></div><div class="field full"><label>Restrictions & stop conditions</label><textarea name="rules">${e(p.rules)}</textarea></div><div class="field full"><label class="check-row" style="text-transform:none;letter-spacing:0;font-size:12px;color:#d8dde2"><input type="checkbox" name="authorized" ${p.authorized?'checked':''}><span>I confirm I own or have explicit authorization for the listed targets and permitted activities.</span></label></div><div class="field full"><label class="check-row" style="text-transform:none;letter-spacing:0;font-size:12px;color:#d8dde2"><input type="checkbox" name="fullTesting" ${p.exploitApproved?'checked':''}><span>My authorization for THIS engagement and scope covers all six phases, including controlled exploitation, limited post-test access verification and cleanup. No additional approval checkbox should be requested in later phases. Rules and stop conditions above still apply.</span></label><span class="field-help">Set once per engagement. This does not authorize testing another network or disregard destructive-testing restrictions.</span></div></div><div class="actions-row"><button class="btn primary" type="submit">Save scope & authorization</button></div></form><div style="margin-top:17px">${scopeGate(p)}</div></section><section class="panel"><div class="panel-header"><div><div class="section-kicker">KALI FIRST STEPS</div><h2 class="panel-title">Get oriented before Shark Jack scanning</h2><p class="panel-desc">Learn the terminal commands you will use on practically every assessment.</p></div></div><div class="command-list">${[{name:'Find your network interfaces',text:'ip -br address',why:'Shows local interface names (eth0/wlan0) and IPv4 addresses.'},{name:'Identify your default gateway',text:'ip route',why:'Shows which gateway Kali would use to reach the network.'},{name:'Find live hosts (ICMP/ARP)',text:`sudo nmap -sn -n ${validScope(p.scope)?p.scope:'YOUR_AUTHORIZED_CIDR'}`,why:'Discovery only, across the authorized subnet. Run from the correct connected adapter.'}].map((c,i)=>commandBox(c,i,scopeSafety(p))).join('')}</div><p class="tiny" style="margin-top:11px">Browser buttons only copy commands; open Kali Terminal and paste them after confirming every address. For localhost diagnostic commands, copying is unlocked after the scope gate like the other commands.</p></section><section class="panel"><div class="panel-header"><div><div class="section-kicker">SHARK JACK DISPLAY</div><h2 class="panel-title">Choose a starting payload</h2><p class="panel-desc">Use built-in payloads when available. Names may vary with installed firmware/library.</p></div><a href="https://github.com/hak5/sharkjackdisplay-payloads" target="_blank" rel="noopener noreferrer" class="small">Official Display library ↗</a></div><div class="item-list">${PAYLOADS.map((q,i)=>`<div class="step-card" style="margin:0"><div class="item-top"><div><div class="step-title"><span class="accent">0${i+1}</span> &nbsp;${e(q.name)}</div><div class="step-desc">${e(q.purpose)}</div></div><span class="pill ${i>1?'medium':'low'}">${e(q.risk)}</span></div><div class="small" style="margin-top:10px"><strong style="color:#dae0e3">Record:</strong> ${e(q.expect)}<br><strong style="color:#dae0e3">Then:</strong> ${e(q.next)}</div><div class="actions-row"><button class="btn small-btn" data-action="log-payload" data-name="${e(q.name)}">+ Log this payload</button></div></div>`).join('')}</div><div class="notice"><strong>How to get loot into Kali:</strong> Once connected to the Shark Jack’s authorized SSH/management interface, browse its actual loot directory. Common Linux commands: <code>pwd</code>, <code>ls -lah</code>, <code>find /root/loot -type f</code>. Transfer a file using <code>scp</code> only after confirming its real path and management IP. Do not assume every payload creates loot. A Shark Jack connected to a workstation's Ethernet jack is a network device—not a USB endpoint agent—and does not automatically reveal workstation files.</div></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Payload execution log</h2><p class="panel-desc">An instant “completed” status is not proof that a scan ran or saved a result. Use the exact interface and result type from your device.</p></div><button class="btn small-btn" data-action="log-payload">+ Add run</button></div><div class="item-list">${p.runs.map(r=>`<div class="item"><div class="item-top"><div><div class="item-name">${e(r.name)}</div><div class="item-meta">${e(r.target||'Unknown target')} • ${e(date(r.at))}</div></div><span class="tag ${r.result==='Saved loot'?'green':r.result==='Failed'?'red':'muted'}">${e(r.result)}</span></div><p class="small">${e(r.notes||'No notes')}</p></div>`).join('')||'<div class="empty"><strong>No payload runs yet</strong>Run a connection test on an approved network and log whether it produced a useful result.</div>'}</div></section>`}
+function assetOptions(p){return p.assets.map(a=>`<option value="${e(a.id)}" ${ui.assetId===a.id?'selected':''}>${e(a.host+(a.hostname?' · '+a.hostname:''))}</option>`).join('')}
+function assetsTable(p){return `<div class="table-wrap"><table class="data-table"><thead><tr><th>Asset</th><th>Open service</th><th>Version hint</th><th>Next action</th></tr></thead><tbody>${p.assets.flatMap(a=>a.ports.length?a.ports.map(s=>`<tr><td><button class="button-link" data-action="choose-asset" data-id="${e(a.id)}">${e(a.host)}</button><div class="tiny">${e(a.hostname)}</div>${!isInScope(a.host,p.scope)?'<span class="pill high">Outside declared scope</span>':''}</td><td><code>${e(s.port+'/'+s.protocol)}</code><div class="tiny">${e(s.service||'unknown')}</div></td><td>${e(s.version||'Unverified')}</td><td><button class="button-link" data-action="go-vuln-asset" data-id="${e(a.id)}">Investigate →</button></td></tr>`):[`<tr><td>${e(a.host)}</td><td colspan="3" class="muted">No open ports recorded</td></tr>`]).join('')||'<tr><td colspan="4" class="muted">No hosts yet. Import a result or add a target.</td></tr>'}</tbody></table></div>`}
+function enumeration(p){const sel=p.assets.find(a=>a.id===ui.assetId)||p.assets[0];return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">IMPORT & PARSE</div><h2 class="panel-title">Bring your scan findings into FieldOps</h2><p class="panel-desc">Accepts Nmap XML (-oX), standard Nmap text (-oN), grepable output (-oG), or Shark Jack loot text.</p></div></div>${scopeGate(p)}<div class="flow-cards"><div class="flow-card"><div class="n">STEP 01</div><div class="t">Run the Shark Jack</div><div class="d">Use a connectivity / discovery payload on an authorized segment.</div></div><div class="flow-card"><div class="n">STEP 02</div><div class="t">Bring back the loot</div><div class="d">Copy a saved scan to your laptop using SSH/SCP or an approved transfer.</div></div><div class="flow-card"><div class="n">STEP 03</div><div class="t">Import and investigate</div><div class="d">Upload here. FieldOps extracts hosts and ports when the format is recognizable.</div></div></div><form id="import-form" class="form-grid"><div class="field full"><label>Select one or more result files</label><input name="files" type="file" accept=".xml,.txt,.log,.nmap,.gnmap,.csv" multiple required><div class="field-help">Each file ≤ 2 MB. SHA-256 is recorded; raw files are not uploaded or stored. Parser supports open ports; unrecognized text is still registered in the evidence manifest.</div></div><div class="field full"><button class="btn primary" type="submit">Import findings & calculate SHA-256</button></div></form><div class="notice"><strong>Recommended Kali output format:</strong> <code>sudo nmap -sV --version-light -oX baseline.xml TARGET_IP</code>. XML gives the best automated parsing. The application never executes this command itself.</div></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Discovered asset inventory</h2><p class="panel-desc">Select an asset for targeted next-step recommendations.</p></div><button class="btn small-btn" data-action="add-port">+ Add host / port</button></div>${assetsTable(p)}${p.assets.length?`<div class="utility-bar"><span class="small">Focus target:</span><select id="asset-select" class="select-field">${assetOptions(p)}</select></div>`:''}<div class="actions-row"><button class="btn small-btn" data-action="go-next-phase">Next: investigate service risk →</button></div></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Evidence import manifest</h2><p class="panel-desc">Hash values identify file contents, not whether the scan itself was valid.</p></div></div><div class="item-list">${p.sources.map(s=>`<div class="item"><div class="item-name">${e(s.name)}</div><div class="item-meta">${e(date(s.at))} • ${s.count} parsed open ports • ${Math.round(s.size/1024)} KB</div><div class="tiny mono" style="overflow-wrap:anywhere;margin-top:5px">SHA-256: ${e(s.sha)}</div></div>`).join('')||'<div class="empty">No result files imported yet.</div>'}</div></section>${sel?recommendPanel(p,sel,'enumeration'):''}`}
+function recommendationsFor(a){if(!a)return [];const output=[];const open=a.ports.filter(s=>s.state==='open'||!s.state);for(const rule of RULES){const matches=open.filter(s=>rule.ports.includes(+s.port) && (rule.id!=='snmp'||s.protocol==='udp'));if(matches.length){const ports=matches.map(s=>s.port).join(', ');output.push({...rule,matchPorts:ports})}}return output}
+function commandBox(cmd,i,enabled){return `<div class="cmd-card"><div class="cmd-top"><div><div class="cmd-title">${e(cmd.name)}</div><div class="cmd-note">${e(cmd.why)}</div></div><button class="btn small-btn ghost" data-action="copy-command" data-cmd="${e(cmd.text)}" ${enabled?'':'disabled'} title="Review authorization before using">Copy</button></div><pre>${e(cmd.text)}</pre></div>`}
+function recommendPanel(p,a,kind){let rules=recommendationsFor(a),enabled=scopeSafety(p)&&isInScope(a.host,p.scope);return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">FINDINGS-DRIVEN PLAYBOOK</div><h2 class="panel-title">Recommended next steps for ${e(a.host)}</h2><p class="panel-desc">Suggestions are generated from observed ports; they are investigative ideas, not confirmed weaknesses.</p></div></div>${rules.length?rules.map(r=>`<div class="step-card"><div class="flex-between"><div class="step-title">${e(r.label)}</div><span class="pill info">Ports ${e(r.matchPorts)}</span></div><p class="small">${e(r.why)}</p><div class="tiny"><strong>Tools:</strong> ${e(r.tools)}</div><div class="command-list" style="margin-top:13px">${r.cmd(targetText(a),r.matchPorts).map((c,i)=>commandBox(c,i,enabled)).join('')}</div></div>`).join(''):`<div class="empty"><strong>No specialized playbook match</strong>Use a scoped version fingerprint and investigate the actual service or manually add details.<div class="command-list" style="margin-top:10px">${commandBox({name:'General service fingerprint',text:`nmap -Pn -sV --version-light ${targetText(a)}`,why:'Identify services carefully. Verify the host and port list before running.'},0,enabled)}</div></div>`}${!enabled?'<div class="callout warn">Commands cannot be copied until the scope is confirmed and a valid host is selected.</div>':''}</section>`}
+function vulnerability(p){const a=p.assets.find(x=>x.id===ui.assetId)||p.assets[0];const findings=p.findings.filter(f=>ui.filter==='all'||f.status===ui.filter);return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">DISCOVER ≠ VULNERABLE</div><h2 class="panel-title">Triage the actual evidence</h2><p class="panel-desc">Service version is a lead. Confirm product, configuration, applicability, and impact before calling it a vulnerability.</p></div></div><div class="callout info">Follow this logic: <strong>Port → service → version/config → trusted advisory → safe validation → finding.</strong> Do not run every Kali tool against every host.</div>${p.assets.length?`<div class="utility-bar"><span class="small">Asset under review:</span><select id="asset-select" class="select-field">${assetOptions(p)}</select></div>`:'<div class="empty">Add or import an asset in Phase 02 to see specific guidance.</div>'}</section>${a?recommendPanel(p,a,'vulnerability'):''}${a?`<section class="panel"><div class="panel-header"><div><div class="section-kicker">SCOPED VULNERABILITY CHECKS</div><h2 class="panel-title">Use the right scanner, then verify</h2><p class="panel-desc">Start with low-impact checks; obtain approval for more intensive tools such as Nikto or Nuclei.</p></div></div><div class="command-list">${commandBox({name:'Nmap safe NSE checks (observed ports only)',text:`nmap -Pn -sV --script safe -p ${a.ports.map(z=>z.port).join(',')||'PORT'} ${targetText(a)}`,why:'Run a broad set of scripts categorized safe. Read the specific script behavior first; safe does not mean zero impact.'},0,scopeSafety(p)&&isInScope(a.host,p.scope)&&a.ports.length>0)}</div><div class="notice">After a scanner flags an issue: check the actual product/version and vendor security bulletin. Use <code>searchsploit</code> locally as a lead, but verify advisory preconditions and confirm with a controlled test before marking the finding validated. A scanner alert is not proof of exploitation.</div></section>`:''}<section class="panel"><div class="panel-header"><div><div class="section-kicker">DOCUMENT A HYPOTHESIS</div><h2 class="panel-title">Record a vulnerability finding</h2><p class="panel-desc">Suspected means unproven. Disproved means tested and ruled out. Validated means the evidence supports the claim.</p></div></div><form id="finding-form"><div class="form-grid"><div class="field"><label>Finding title</label><input name="title" required maxlength="130" placeholder="e.g. SMB signing not required"></div><div class="field"><label>Affected host</label><input name="host" value="${e(a?.host||'')}" placeholder="10.10.20.10" required></div><div class="field"><label>Severity (judgment)</label><select name="severity"><option value="info">Informational</option><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="critical">Critical</option></select></div><div class="field"><label>Validation state</label><select name="status"><option value="suspected">Suspected / requires validation</option><option value="validated">Validated with evidence</option><option value="disproved">Disproved / false positive</option></select></div><div class="field full"><label>Exact evidence / reproduction notes</label><textarea name="evidence" required placeholder="Tool command, actual result, timestamp, relevant sanitized output"></textarea></div><div class="field full"><label>Security impact</label><textarea name="impact" placeholder="What could a realistic authorized attacker achieve?"></textarea></div><div class="field full"><label>Remediation recommendation</label><textarea name="remediation" placeholder="Precise fix, owner or priority"></textarea></div></div><div class="actions-row"><button class="btn primary" type="submit">+ Save finding</button></div></form></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Findings register</h2><p class="panel-desc">Only validated issues should be asserted as proven in a client report.</p></div><span class="tag muted">${p.findings.length} recorded</span></div><div class="utility-bar">${[['all','All'],['suspected','Suspected'],['validated','Validated'],['disproved','Disproved']].map(([k,t])=>`<button class="chip ${ui.filter===k?'active':''}" data-action="filter" data-id="${k}">${t}</button>`).join('')}</div><div class="item-list">${findings.map(f=>`<div class="item"><div class="item-top"><div><div class="item-name">${e(f.title)}</div><div class="item-meta">${e(f.host)} • ${e(date(f.at))}</div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><span class="pill ${severityCls(f.severity)}">${e(f.severity)}</span><span class="pill ${f.status==='validated'?'low':f.status==='disproved'?'info':'medium'}">${e(f.status)}</span></div></div><p class="small" style="white-space:pre-wrap">${e(f.evidence)}</p><div class="actions-row"><button class="btn small-btn" data-action="edit-finding" data-id="${e(f.id)}">Edit / validate</button><button class="btn small-btn ghost" data-action="delete-finding" data-id="${e(f.id)}">Remove</button></div></div>`).join('')||'<div class="empty"><strong>No findings in this filter</strong>Record a hypothesis after researching a discovered service.</div>'}</div></section>`}
+function exploitation(p){return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">PROOF OF CONCEPT / CONTROLLED</div><h2 class="panel-title">Confirm explicit exploitation authorization</h2><p class="panel-desc">Network discovery permission is not automatically permission to exploit or access data.</p></div></div><form id="approval-form"><label class="check-row"><input type="checkbox" name="exploitApproved" ${p.exploitApproved?'checked':''}><span>I have explicit written permission for minimally invasive proof-of-concept exploitation of the listed test targets, subject to the rules of engagement.</span></label><div class="actions-row"><button class="btn" type="submit">Save exploitation approval status</button></div></form><div class="callout ${p.exploitApproved?'ok':'warn'}" style="margin-top:13px">${p.exploitApproved?'Approval marked in workspace. Verify the exact target, test method, window, exclusions, and rollback before every attempt.':'Exploitation tracking is gated. If approval is absent, record “Not attempted” and complete reporting from verified non-exploit evidence.'}</div></section><section class="panel"><div class="panel-header"><div><div class="section-kicker">THE SAFEST VALID PROOF</div><h2 class="panel-title">Plan one minimum-impact test</h2><p class="panel-desc">Aim to establish impact without retrieving secrets, deploying persistence, or modifying unrelated systems.</p></div></div><div class="flow-cards"><div class="flow-card"><div class="n">01 / RESEARCH</div><div class="t">Find a validated issue</div><div class="d">Consult vendor guidance, verify exact version and preconditions.</div></div><div class="flow-card"><div class="n">02 / SIMULATE</div><div class="t">Use isolated test machines</div><div class="d">In your Hyper-V lab, study Metasploit's <code>search</code>, <code>info</code>, <code>check</code> documentation.</div></div><div class="flow-card"><div class="n">03 / EVIDENCE</div><div class="t">Prove only what is necessary</div><div class="d">Capture minimal output, stop, and confirm cleanup.</div></div></div><div class="callout info">The app does not generate arbitrary exploit payloads or run exploitation frameworks. It tracks permitted tests and helps keep your proof limited and reportable.</div><form id="test-form" style="margin-top:19px"><div class="form-grid"><div class="field full"><label>Linked validated finding (optional)</label><select name="findingId"><option value="">No linked finding / planning or skipped test</option>${p.findings.filter(f=>f.status==='validated').map(f=>`<option value="${e(f.id)}">${e(f.title)} — ${e(f.host)}</option>`).join('')}</select><span class="field-help">Choose a confirmed issue with supporting evidence; the link is recorded with the test.</span></div><div class="field"><label>Target host</label><input name="host" value="${e(p.findings.find(f=>f.status==='validated')?.host||'')}" required placeholder="e.g. 10.10.20.55"></div><div class="field"><label>Test result</label><select name="result"><option>Not attempted</option><option>Blocked — no authorization</option><option>Not vulnerable</option><option>Proof confirmed</option><option>Inconclusive</option></select></div><div class="field full"><label>Objective / hypothesis</label><input name="objective" required placeholder="Demonstrate read-only access to designated test resource"></div><div class="field full"><label>Approved test method and rollback / stop conditions</label><textarea name="method" placeholder="Lab setup, selected module/reference, approval boundary, stop rule"></textarea></div><div class="field full"><label>Observed proof (sanitized)</label><textarea name="evidence" placeholder="Minimal result / screenshot reference; no credential dumps"></textarea></div><div class="field full"><label>Cleanup verification</label><textarea name="cleanup" placeholder="Processes closed, test accounts cleaned up, rollback confirmed"></textarea></div></div><div class="actions-row"><button type="submit" class="btn primary">Record controlled test</button></div></form></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Exploitation test log</h2><p class="panel-desc">A record of both performed and explicitly skipped tests.</p></div></div><div class="item-list">${p.tests.map(t=>`<div class="item"><div class="item-top"><div><div class="item-name">${e(t.objective)}</div><div class="item-meta">${e(t.host)} • ${e(date(t.at))}${t.findingId?' • Linked finding':''}</div></div><span class="tag ${t.result==='Proof confirmed'?'green':'muted'}">${e(t.result)}</span></div><p class="small">${e(t.evidence||t.method||'No evidence recorded')}</p></div>`).join('')||'<div class="empty">No controlled test records yet.</div>'}</div></section>`}
+function postExploit(p){return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">ACCESS / IMPACT / CLEANUP</div><h2 class="panel-title">Confirm what the test actually proved</h2><p class="panel-desc">The goal is impact analysis, not “how far can I go?”. Keep test boundaries narrow.</p></div></div><div class="flow-cards"><div class="flow-card"><div class="n">ACCESS</div><div class="t">What privilege?</div><div class="d">Record the effective user or role in a designated test environment.</div></div><div class="flow-card"><div class="n">REACH</div><div class="t">What was exposed?</div><div class="d">Describe only the reachable test resources or categories of data.</div></div><div class="flow-card"><div class="n">RESTORE</div><div class="t">What was cleaned?</div><div class="d">Close sessions, remove approved temporary artifacts, validate original settings.</div></div></div><div class="callout warn">Do not harvest credentials, browse real private records, establish persistence, or pivot into other systems unless those activities are separately authorized with clear controls. Do not place sensitive captured data in report text.</div><form id="post-form" style="margin-top:20px"><div class="field"><label>Impact verification & cleanup notes</label><textarea name="postNotes" style="min-height:170px" placeholder="Test host / account, demonstrated privilege, exposed data category, limits, cleanup status, time…">${e(p.postNotes)}</textarea></div><div class="actions-row"><button class="btn primary" type="submit">Save post-exploitation notes</button></div></form></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Evidence handling guide</h2></div><div class="item-list">${[['Use minimum proof','Capture a banner, non-sensitive test result or access-policy response—not entire databases or credential files.'],['Separate evidence from reports','Keep original scan files in a controlled local evidence folder; FieldOps records their SHA-256 hashes only.'],['Keep a clear custody trail','Record who performed the test, when it happened, where the source artifact lives, and whether any test system was changed.'],['Verify restoration','End sessions, reverse explicit test changes, and document unresolved cleanup issues.']].map(([t,d],i)=>`<div class="step-card" style="margin:0"><div class="step-top"><span class="step-index">0${i+1}</span><div><div class="step-title">${e(t)}</div><div class="step-desc">${e(d)}</div></div></div></div>`).join('')}</div></section>`}
+function report(p){return `<section class="panel"><div class="panel-header"><div><div class="section-kicker">DELIVERABLE</div><h2 class="panel-title">Build the final report</h2><p class="panel-desc">Present observed facts, differentiate suspected findings, and give prioritized actions.</p></div></div><form id="report-form"><div class="form-grid"><div class="field full"><label>Executive summary / assessment conclusion</label><textarea name="summary" style="min-height:140px" placeholder="Describe scope, exposure, validated risks, and top priorities in plain language…">${e(p.summary)}</textarea></div><div class="field full"><label>Limitations</label><textarea name="limitations" placeholder="Systems not reachable, time constraints, inaccessible accounts, scans not run…">${e(p.limitations)}</textarea></div><div class="field full"><label>Priority recommendations</label><textarea name="recommendations" style="min-height:105px" placeholder="Prioritize confirmed remediation by risk, owner, and urgency…">${e(p.recommendations)}</textarea></div></div><div class="actions-row"><button class="btn primary" type="submit">Save report narrative</button><button class="btn" type="button" data-action="print-report">Print / Save as PDF</button><button class="btn" type="button" data-action="download-report">Download .HTML</button><button class="btn" type="button" data-action="download-md">Download .MD</button></div></form></section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Live report preview</h2><p class="panel-desc">This view is generated from your current assessment, including imported evidence hashes.</p></div></div>${reportHTML(p)}</section><section class="panel"><div class="panel-header"><div><h2 class="panel-title">Closeout checklist</h2></div></div><div class="callout info">Before sharing a report: confirm host ownership, double-check every stated vulnerability, remove sensitive data, ensure exploitation is accurately described, and securely back up the encrypted workspace. Reports are <strong>not</strong> automatically uploaded or shared.</div><div class="actions-row"><button class="btn primary" data-action="export-backup">↧ Export encrypted workspace backup</button></div></section>`}
+function modal(p){if(ui.modal==='reset')return `<div class="modal-cover"><div class="modal" role="dialog" aria-modal="true" aria-label="Reset workspace"><div class="flex-between"><h2>Reset this workspace</h2><button class="btn small-btn ghost" data-action="close-modal">✕ Close</button></div><div class="callout warn" style="margin-top:15px"><strong>Permanent local deletion.</strong> This removes all engagements, notes, imported findings and the encrypted vault saved for OAC FieldOps in <strong>this browser profile only</strong>. Your GitHub site and separately downloaded backups are not deleted. There is no undo.</div><div class="actions-row"><button class="btn small-btn" type="button" data-action="export-backup">↧ Download encrypted backup first</button></div><form id="reset-form" class="form-grid"><div class="field full"><label>Type RESET to confirm</label><input name="confirmation" required autocomplete="off" spellcheck="false" placeholder="RESET"></div><div class="field full"><label class="check-row" style="text-transform:none;letter-spacing:0;font-size:12px"><input type="checkbox" name="understand" required><span>I understand that all locally saved assessments will be permanently erased unless I have a usable encrypted backup.</span></label></div><div class="field full"><button class="btn primary" type="submit">Permanently reset local workspace</button></div></form></div></div>`;
+if(ui.modal==='engagement')return `<div class="modal-cover" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="Create engagement"><div class="flex-between"><h2>New engagement</h2><button class="btn small-btn ghost" data-action="close-modal">✕ Close</button></div><p class="small">A separate assessment within your same encrypted vault.</p><form id="engagement-form" class="form-grid"><div class="field full"><label>Engagement title</label><input name="name" maxlength="90" required placeholder="e.g. Home network baseline"></div><div class="field full"><label>Owned or authorized target scope</label><input name="scope" required placeholder="10.10.10.0/24"></div><div class="field full"><label>Environment type</label><select name="kind"><option value="lab">Isolated lab</option><option value="owned">My own network</option><option value="client">Client-approved assessment</option></select></div><div class="field full"><button class="btn primary" type="submit">Create assessment</button></div></form></div></div>`;
+if(ui.modal==='payload')return `<div class="modal-cover"><div class="modal" role="dialog" aria-modal="true" aria-label="Log payload"><div class="flex-between"><h2>Log Shark Jack run</h2><button class="btn small-btn ghost" data-action="close-modal">✕ Close</button></div><p class="small">Log the result even if a payload finished immediately or produced no loot.</p><form id="payload-form" class="form-grid"><div class="field full"><label>Payload name</label><input name="name" required value="${e(ui.editId||'')}" placeholder="e.g. Advanced Ping Test"></div><div class="field"><label>Target / subnet</label><input name="target" placeholder="10.10.10.1"></div><div class="field"><label>Observed result</label><select name="result"><option>Success (no file)</option><option>Saved loot</option><option>No response</option><option>Failed</option><option>Unknown</option></select></div><div class="field full"><label>Notes, path and next steps</label><textarea name="notes" placeholder="Exact screen output, output file path, observations…"></textarea></div><div class="field full"><button class="btn primary" type="submit">Save payload run</button></div></form></div></div>`;
+if(ui.modal==='port')return `<div class="modal-cover"><div class="modal" role="dialog" aria-modal="true" aria-label="Add asset"><div class="flex-between"><h2>Add discovered port</h2><button class="btn small-btn ghost" data-action="close-modal">✕ Close</button></div><p class="small">Use facts from actual output; do not invent ports or versions.</p><form id="port-form" class="form-grid"><div class="field"><label>IPv4 address or hostname</label><input name="host" required placeholder="10.10.20.10"></div><div class="field"><label>Port number</label><input name="port" required type="number" min="1" max="65535" placeholder="445"></div><div class="field"><label>Protocol</label><select name="protocol"><option>tcp</option><option>udp</option></select></div><div class="field"><label>Service (if known)</label><input name="service" placeholder="microsoft-ds"></div><div class="field full"><label>Version / fingerprint</label><input name="version" placeholder="Windows SMB / confirmed vendor build"></div><div class="field full"><button class="btn primary" type="submit">Add asset / service</button></div></form></div></div>`;
+if(ui.modal==='finding'){const f=p.findings.find(f=>f.id===ui.editId);if(!f)return '';return `<div class="modal-cover"><div class="modal" role="dialog" aria-modal="true" aria-label="Edit finding"><div class="flex-between"><h2>Edit finding</h2><button class="btn small-btn ghost" data-action="close-modal">✕ Close</button></div><form id="edit-finding-form" class="form-grid"><div class="field full"><label>Title</label><input name="title" required value="${e(f.title)}"></div><div class="field"><label>Host</label><input name="host" required value="${e(f.host)}"></div><div class="field"><label>Severity</label><select name="severity">${['info','low','medium','high','critical'].map(v=>`<option ${v===f.severity?'selected':''}>${v}</option>`).join('')}</select></div><div class="field"><label>Validation</label><select name="status">${['suspected','validated','disproved'].map(v=>`<option ${v===f.status?'selected':''}>${v}</option>`).join('')}</select></div><div class="field full"><label>Evidence</label><textarea name="evidence" required>${e(f.evidence)}</textarea></div><div class="field full"><label>Impact</label><textarea name="impact">${e(f.impact)}</textarea></div><div class="field full"><label>Remediation</label><textarea name="remediation">${e(f.remediation)}</textarea></div><div class="field full"><button type="submit" class="btn primary">Save finding changes</button></div></form></div></div>`}
+return ''}
+function render(){const app=$('#app');if(!app)return;const p=current();app.className='';app.innerHTML=p?shell(p):authPage()+(ui.modal==='reset'?modal(null):'');if(!$('#print-report'))document.body.insertAdjacentHTML('beforeend','<div id="print-report" class="hide-on-screen"></div>');$('#print-report').innerHTML=p?reportHTML(p):''}
+function isInScope(host,scope){if(!validIPv4(host)||!validScope(scope))return false;const [network,bits='32']=scope.split('/');const asNum=a=>a.split('.').reduce((acc,n)=>((acc<<8)|(+n))>>>0,0);const mask=+bits===0?0:(0xffffffff << (32-(+bits)))>>>0;return (asNum(host)&mask)===(asNum(network)&mask)}
+function mergeHost(p,host,hostname='',ports=[]){if(!validIPv4(host)&&!validTarget(host))return 0;let a=p.assets.find(x=>x.host===host);if(!a){a={id:id(),host,hostname:hostname||'',ports:[],notes:''};p.assets.push(a)}else if(!a.hostname&&hostname)a.hostname=hostname;let count=0;for(const s of ports){if(!Number.isInteger(+s.port)||+s.port<1||+s.port>65535)continue;const protocol=s.protocol==='udp'?'udp':'tcp';if((s.state||'open')!=='open')continue;let original=a.ports.find(z=>z.port===+s.port&&z.protocol===protocol);if(original){if(s.version)original.version=String(s.version).slice(0,220);if(s.service&&(!original.service||original.service==='unknown'))original.service=String(s.service).slice(0,90)}else{a.ports.push({port:+s.port,protocol,service:String(s.service||'unknown').slice(0,90),version:String(s.version||'').slice(0,220),state:'open',source:s.source||'import'});count++}}a.ports.sort((x,y)=>x.port-y.port);return count}
+function parseScan(text,filename){const found=[];const add=(host,name,ports)=>{if(host&&validTarget(host))found.push({host,hostname:name||'',ports})};if(/^\s*<\?xml|^\s*<nmaprun[\s>]/i.test(text)){
+ const xml=new DOMParser().parseFromString(text,'application/xml');if(xml.querySelector('parsererror'))throw Error('Invalid XML in '+filename);
+ for(const h of xml.querySelectorAll('nmaprun > host')){const status=h.querySelector(':scope > status')?.getAttribute('state');if(status&&status!=='up')continue;const addresses=[...h.querySelectorAll(':scope > address')];const addr=addresses.find(x=>x.getAttribute('addrtype')==='ipv4')?.getAttribute('addr');if(!addr)continue;const name=h.querySelector(':scope > hostnames > hostname')?.getAttribute('name')||'';const ports=[];for(const port of h.querySelectorAll(':scope > ports > port')){if(port.querySelector(':scope > state')?.getAttribute('state')!=='open')continue;const svc=port.querySelector(':scope > service');ports.push({port:+port.getAttribute('portid'),protocol:port.getAttribute('protocol'),service:svc?.getAttribute('name')||'unknown',version:[svc?.getAttribute('product'),svc?.getAttribute('version'),svc?.getAttribute('extrainfo')].filter(Boolean).join(' '),state:'open',source:filename})}add(addr,name,ports)}
+ return found}
+ let last=null;
+ for(const line of text.split(/\r?\n/)){
+  const lineHost=line.match(/^Nmap scan report for\s+(?:(.+?)\s+\((\d{1,3}(?:\.\d{1,3}){3})\)|(\d{1,3}(?:\.\d{1,3}){3}))/i);
+  if(lineHost){last={host:lineHost[2]||lineHost[3],hostname:lineHost[1]||'',ports:[]};found.push(last);continue}
+  const linePort=line.match(/^\s*(\d{1,5})\/(tcp|udp)\s+open\s+(\S+)(?:\s+(.+))?$/i);
+  if(linePort&&last){last.ports.push({port:+linePort[1],protocol:linePort[2].toLowerCase(),service:linePort[3],version:(linePort[4]||'').trim(),state:'open',source:filename});continue}
+  const grep=line.match(/^Host:\s+(\d{1,3}(?:\.\d{1,3}){3})\s+\(([^)]*)\).*?Ports:\s+(.+)$/i);
+  if(grep){const ports=[];for(const raw of grep[3].split(/,\s*/)){const bits=raw.trim().split('/');if(bits[1]==='open'){ports.push({port:+bits[0],protocol:bits[2]||'tcp',service:bits[4]||'unknown',version:bits[6]||'',state:'open',source:filename})}}add(grep[1],grep[2],ports)}
+  // Accept compact, common text loot lines from recon scripts.
+  const compact=line.match(/^\s*((?:\d{1,3}\.){3}\d{1,3})[:\s]+(\d{1,5})(?:\/(tcp|udp))?\s+(?:open|OPEN)\b(?:\s+([^\s]+))?/);
+  if(compact){add(compact[1],'',[{port:+compact[2],protocol:compact[3]||'tcp',service:compact[4]||'unknown',state:'open',source:filename}]);continue}
+  const arp=line.match(/(?:^|\s|\()((?:\d{1,3}\.){3}\d{1,3})\)?\s+(?:at\s+)?([a-f0-9]{2}(?::[a-f0-9]{2}){5})\b/i);
+  if(arp){add(arp[1],'',[]);continue}
+  const hostUp=line.match(/^\s*((?:\d{1,3}\.){3}\d{1,3})\s+(?:is\s+up|host\s+up)\b/i);
+  if(hostUp){add(hostUp[1],'',[])}
+ }
+ return found}
+async function importFiles(p,files){let inputs=0,foundHosts=0,ports=0;for(const file of files){if(file.size>2*1024*1024)throw Error(file.name+' exceeds the 2 MB limit');const buffer=await file.arrayBuffer();const digest=await crypto.subtle.digest('SHA-256',buffer);const sha=[...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join('');if(p.sources.some(s=>s.sha===sha))continue;const text=dec.decode(buffer);const hosts=parseScan(text,file.name);let n=0;for(const a of hosts){n+=mergeHost(p,a.host,a.hostname,a.ports)}p.sources.unshift({id:id(),name:file.name,size:file.size,sha,at:time(),count:n});inputs++;foundHosts+=hosts.length;ports+=n}log(p,`Imported ${inputs} result file(s), ${foundHosts} host rows, ${ports} new open services`);await persist();render();message(`Imported ${inputs} file(s). Found ${ports} new open ports; review the inventory.`)}
+const data=f=>Object.fromEntries(new FormData(f).entries());
+const trim=o=>Object.fromEntries(Object.entries(o).map(([k,v])=>[k,typeof v==='string'?v.trim():v]));
+async function handleSubmit(ev){const f=ev.target;if(!(f instanceof HTMLFormElement))return;ev.preventDefault();if(ui.busy)return;ui.busy=true;const d=trim(data(f));const p=current();try{
+ if(f.id==='reset-form'){if(d.confirmation!=='RESET'||!f.elements.understand.checked)throw Error('Type RESET and confirm permanent deletion to continue.');resetVault();message('Local workspace reset. Create a new passphrase to start fresh.')}
+ else if(f.id==='auth-form'){if(d.pass.length<10)throw Error('Use at least 10 characters. A longer unique passphrase is safer.');if(localStorage.getItem(STORE))await unlock(d.pass);else{if(d.pass!==d.confirm)throw Error('Passphrases do not match');await createVault(d.pass)}}
+ else if(!p)throw Error('Unlock workspace first');
+ else if(f.id==='scope-form'){if(!validScope(d.scope))throw Error('Scope must be a valid IPv4 address or CIDR, e.g. 10.10.20.0/24');Object.assign(p,{name:d.name,client:d.client,operator:d.operator,scope:d.scope,permissionBy:d.permissionBy,rules:d.rules,kind:d.kind,authorized:!!f.elements.authorized.checked,exploitApproved:!!f.elements.authorized.checked&&!!f.elements.fullTesting?.checked});await commit('Updated engagement scope and all-phase authorization')}
+ else if(f.id==='engagement-form'){if(!validScope(d.scope))throw Error('Enter valid IPv4 scope');const q=makeEngagement(d.name);q.scope=d.scope;q.kind=d.kind;q.client=d.kind==='client'?'Client engagement':'Personal / authorized lab';vault.engagements.push(q);vault.activeId=q.id;ui.modal='';ui.assetId='';ui.phase=0;await commit('Created engagement')}
+ else if(f.id==='payload-form'){p.runs.unshift({id:id(),name:d.name,target:d.target,result:d.result,notes:d.notes,at:time()});ui.modal='';ui.editId='';await commit('Logged payload: '+d.name)}
+ else if(f.id==='port-form'){if(!validTarget(d.host))throw Error('Provide a valid host');mergeHost(p,d.host,'',[{port:+d.port,protocol:d.protocol,service:d.service||'unknown',version:d.version,source:'manual'}]);ui.modal='';ui.assetId=p.assets.find(a=>a.host===d.host)?.id||'';await commit('Added manual port '+d.host+':'+d.port)}
+ else if(f.id==='import-form'){const files=[...f.elements.files.files];if(!files.length)throw Error('Select one or more files');await importFiles(p,files)}
+ else if(f.id==='finding-form'){p.findings.unshift({id:id(),at:time(),...d});await commit('Added '+d.status+' finding: '+d.title)}
+ else if(f.id==='edit-finding-form'){const q=p.findings.find(x=>x.id===ui.editId);if(!q)throw Error('Finding missing');Object.assign(q,d);ui.modal='';ui.editId='';await commit('Updated finding: '+q.title)}
+ else if(f.id==='approval-form'){p.exploitApproved=!!f.elements.exploitApproved.checked;await commit('Exploitation approval status: '+(p.exploitApproved?'recorded':'not approved'))}
+ else if(f.id==='test-form'){if(d.result==='Proof confirmed'&&!p.exploitApproved)throw Error('Cannot mark exploit proof confirmed without explicit test approval');if(d.result==='Proof confirmed'&&!isInScope(d.host,p.scope))throw Error('Proof confirmed must reference an IPv4 asset within the approved network scope');p.tests.unshift({id:id(),at:time(),...d});await commit('Logged controlled test: '+d.result)}
+ else if(f.id==='post-form'){p.postNotes=d.postNotes;await commit('Saved post-exploitation notes')}
+ else if(f.id==='report-form'){Object.assign(p,{summary:d.summary,limitations:d.limitations,recommendations:d.recommendations});await commit('Updated report narrative')}
+ }catch(err){fail(err)}finally{ui.busy=false}}
+async function handleChange(ev){const el=ev.target;try{
+ if(el.id==='restore-backup'&&el.files?.length){await restoreBackup(el.files[0]);return}
+ if(!vault)return;const p=current();
+ if(el.dataset.check){p.checks[el.dataset.check]=el.checked;await commit((el.checked?'Completed':'Reopened')+' checklist: '+el.dataset.check)}
+ else if(el.id==='engagement-select'){vault.activeId=el.value;ui.assetId='';ui.phase=0;await persist();render()}
+ else if(el.id==='asset-select'){ui.assetId=el.value;render()}
+
+ }catch(err){fail(err)}}
+async function restoreBackup(file){if(file.size>15*1024*1024)throw Error('Backup exceeds 15 MB');const content=JSON.parse(await file.text());if(content.version!==1||typeof content.salt!=='string'||typeof content.iv!=='string'||typeof content.data!=='string')throw Error('This is not an OAC FieldOps encrypted backup');if(!confirm('Restoring replaces the encrypted vault in this browser. Export your current backup first. Continue?'))return;localStorage.setItem(STORE,JSON.stringify(content));lock();message('Encrypted backup loaded. Unlock it using its original passphrase.')}
+async function copy(text){if(!navigator.clipboard?.writeText)throw Error('Clipboard permission unavailable; select the command text manually');await navigator.clipboard.writeText(text);message('Command copied. Verify host, scope and permission before executing.')}
+async function handleClick(ev){const node=ev.target.closest('[data-phase],[data-action]');if(!node)return;const p=current();const action=node.dataset.action;try{
+ if(node.dataset.phase!==undefined){ui.phase=+node.dataset.phase;ui.modal='';render();window.scrollTo(0,0);return}
+ if(action==='lock'){lock();return}
+ if(action==='show-reset'){if(!localStorage.getItem(STORE))return;ui.modal='reset';render();return}
+ if(action==='new-engagement'){ui.modal='engagement';render();return}
+ if(action==='close-modal'){ui.modal='';ui.editId='';render();return}
+ if(action==='next-phase'||action==='go-next-phase'){ui.phase=Math.min(5,ui.phase+1);render();window.scrollTo(0,0);return}
+ if(action==='go-vuln-asset'){ui.assetId=node.dataset.id;ui.phase=2;render();window.scrollTo(0,0);return}
+ if(action==='choose-asset'){ui.assetId=node.dataset.id;render();return}
+ if(action==='log-payload'){ui.modal='payload';ui.editId=node.dataset.name||'';render();return}
+ if(action==='add-port'){ui.modal='port';render();return}
+ if(action==='filter'){ui.filter=node.dataset.id;render();return}
+ if(action==='edit-finding'){ui.modal='finding';ui.editId=node.dataset.id;render();return}
+ if(action==='delete-finding'){const f=p.findings.find(q=>q.id===node.dataset.id);if(f&&confirm('Remove finding “'+f.title+'” from this engagement?')){p.findings=p.findings.filter(q=>q.id!==f.id);await commit('Removed finding: '+f.title)}return}
+ if(action==='copy-command'){const a=p.assets.find(a=>a.id===ui.assetId)||p.assets[0];if(!scopeSafety(p)||!a||!isInScope(a.host,p.scope))throw Error('Confirm authorization and an IPv4 host inside the declared scope before copying.');await copy(node.dataset.cmd);return}
+ if(action==='export-backup'){if(!localStorage.getItem(STORE))throw Error('No vault yet');saveBlob('OAC-FieldOps-encrypted-backup-'+stamp()+'.json',localStorage.getItem(STORE),'application/json');message('Encrypted backup downloaded. Store it securely.');return}
+ if(action==='print-report'){if(!p)return;$('#print-report').innerHTML=reportHTML(p);window.print();return}
+ if(action==='download-report'){exportHTML(p);return}
+ if(action==='download-md'){saveBlob(fname(p.name)+'-report.md',reportPlain(p),'text/markdown;charset=utf-8');return}
+ if(action==='import-backup-picker'){$('#restore-backup')?.click();return}
+ }catch(err){fail(err)}}
+document.addEventListener('submit',handleSubmit);document.addEventListener('change',handleChange);document.addEventListener('click',handleClick);
+window.addEventListener('keydown',ev=>{if(ev.key==='Escape'&&ui.modal){ui.modal='';render()}});
+window.addEventListener('error',event=>console.error('FieldOps application error:',event.message));
+if(!crypto?.subtle||!localStorage){$('#app').innerHTML='<div class="auth-wrap"><div><h1>Secure browser required</h1><p>Open this application over HTTPS in an up-to-date browser with Web Crypto and local storage enabled.</p></div></div>'}else render();
+
+/* OAC FieldOps 2.0 guided assessment layer.
+ * Extends the original encrypted browser-only workspace without changing its vault format.
+ * No remote APIs; never executes on a target; imported evidence is user-supplied.
+ */
+'use strict';
+
+const FO_PAYLOADS = [
+ {id:'simple',name:'Simple Connection Test',confidence:'Observed on your device',risk:'Very low',purpose:'Verify Ethernet link, DHCP lease, gateway and internet reachability; not a port scan.',target:'Gateway or public reachability endpoint shown by payload',params:[['NETMODE','DHCP_CLIENT on an existing LAN with DHCP. Avoid DHCP_SERVER on a normal LAN.'],['Target','Use the gateway for local connectivity; an external IP only if authorized.'],['Timeout','If configurable: 5 seconds per reachability test; stop after about 20 seconds.']],expect:'Interface address, gateway, DNS, test outcome.',next:'If DHCP or route fails, troubleshoot before any discovery.',loot:'May not write a file; record on-device results.'},
+ {id:'ping',name:'Advanced Ping Test',confidence:'Hak5 tutorial confirms name',risk:'Very low',purpose:'Test a known in-scope IP without assuming ping failure means device is offline.',target:'Single IPv4, e.g. 10.10.10.1 on an owned network',params:[['Host / target','Enter a single in-scope IP.'],['Count','4 probes if the payload presents a count option.'],['Per-probe timeout','2 seconds if a timeout field exists; start conservatively.'],['Overall wait','15 seconds is a sensible initial ceiling if offered.']],expect:'Target, successes, round-trip or time-outs.',next:'If ICMP fails, host may still be up; proceed with permitted service check.',loot:'Check the Payload Log; saving loot depends on payload implementation.'},
+ {id:'hunter',name:'Network Hunter',confidence:'Name observed in your earlier loot filenames',risk:'Low–moderate',purpose:'Inventory devices and reachable services on the authorized wired segment.',target:'First a single in-scope host; expand only if engagement permits',params:[['Network mode','DHCP_CLIENT for a LAN with DHCP.'],['Target / CIDR','Use only your engagement CIDR; do not assume auto-detected networks are fully authorized.'],['Host timeout','60 seconds per host to start, if available.'],['Retries','1 retry if the payload exposes max-retries.'],['Overall runtime','2–5 minutes maximum for a small lab; check actual script.']],expect:'Observed hosts, addresses, ports or services; exact fields vary by installed version.',next:'Transfer any file and import it in Phase 02; absence of ports is not proof none exist.',loot:'A file named network_hunter_*.txt was previously observed; actual path must be checked.'},
+ {id:'spray',name:'All Spray',confidence:'Name observed in your earlier loot filenames',risk:'Moderate / variable',purpose:'Broader discovery. Do not run before reading the installed script and confirming the selected network scope.',target:'Explicitly approved test subnet; begin with a single test host when possible',params:[['Network mode','DHCP_CLIENT only when joining a normal switched LAN.'],['Targets','Restrict to authorized IP/CIDR, never an inferred large subnet.'],['Host timeout','60 seconds as an initial cap if the installed script supports it.'],['Retries','1 maximum to start if configurable.'],['Runtime','Keep initial test brief and monitor device; the actual behavior is payload-dependent.']],expect:'Actual output differs by installed source; verify whether it is an address, port, or packet-capture payload.',next:'Import only non-sensitive scan output; first review the payload code for capture/exfiltration behavior.',loot:'A file named all_spray_*.txt was previously observed; confirm real path.'}
+];
+const FO_KNOWN = [
+ {id:'ftp',ports:[21],key:'ftp-anon',name:'FTP anonymous-access check',tool:'Nmap ftp-anon',risk:'Low',why:'Tests whether the FTP server explicitly allows anonymous authentication.',expect:'An output line containing “Anonymous FTP login allowed” indicates a candidate access-control issue.',result:'ftp',cmd:(h,port)=>`nmap -Pn -n -p ${port} --script ftp-anon -oX oac-${h}-${port}-ftp.xml ${h}`},
+ {id:'ssh',ports:[22],key:'ssh',name:'SSH version / host identity',tool:'Nmap, ssh-keyscan',risk:'Very low',why:'Determine version and public host identity before assessing patch status.',expect:'Version/banner only. No password attempts. A version string is not a confirmed CVE.',cmd:(h,port)=>`nmap -Pn -n -sV --version-light -p ${port} -oX oac-${h}-${port}-ssh.xml ${h}`},
+ {id:'http',ports:[80,8080,8000,8008,8888],key:'http-methods',name:'HTTP methods / headers',tool:'Nmap HTTP scripts',risk:'Low',why:'Check exposed methods and selected response metadata.',expect:'PUT/DELETE reported as potentially risky is a hypothesis; verify actual access controls.',result:'http',cmd:(h,port)=>`nmap -Pn -n -p ${port} --script http-methods,http-headers,http-title -oX oac-${h}-${port}-http.xml ${h}`},
+ {id:'tls',ports:[443,8443,9443],key:'ssl-enum-ciphers',name:'TLS protocol / cipher review',tool:'Nmap ssl-enum-ciphers',risk:'Low–moderate',why:'Identify supported legacy TLS protocols and obsolete ciphers; handshakes can be numerous.',expect:'TLSv1.0 / TLSv1.1 observations may justify a candidate finding after validation.',result:'tls',cmd:(h,port)=>`nmap -Pn -n -p ${port} --script ssl-enum-ciphers -oX oac-${h}-${port}-tls.xml ${h}`},
+ {id:'smb',ports:[445],key:'smb2-security-mode',name:'SMB signing and dialects',tool:'Nmap SMB scripts',risk:'Low',why:'Learn the signing requirement and enabled SMB protocols, not share contents.',expect:'“Message signing enabled but not required” produces a candidate configuration finding.',result:'smb',cmd:(h,port)=>`nmap -Pn -n -p ${port} --script smb-protocols,smb2-security-mode -oX oac-${h}-${port}-smb.xml ${h}`},
+ {id:'rdp',ports:[3389],key:'rdp-enum-encryption',name:'RDP security negotiation',tool:'Nmap RDP script',risk:'Low',why:'Discover the advertised RDP security layers without credential guessing.',expect:'Configuration evidence, not proof of unauthorized RDP access.',cmd:(h,port)=>`nmap -Pn -n -p ${port} --script rdp-enum-encryption -oX oac-${h}-${port}-rdp.xml ${h}`},
+ {id:'ldap',ports:[389,636,3268,3269,88],key:'ldap',name:'Directory-service fingerprint',tool:'Nmap version detection',risk:'Low',why:'Identify an expected directory service and verify exposure before requesting a test account.',expect:'Exposed ports alone are normal on domain controllers and do not imply compromise.',cmd:(h,port)=>`nmap -Pn -n -sV --version-light -p ${port} -oX oac-${h}-${port}-ldap.xml ${h}`},
+ {id:'dns',ports:[53],key:'dns',name:'DNS fingerprint',tool:'Nmap version detection',risk:'Low',why:'Confirm server role and service advertisement without zone transfers.',expect:'A DNS listener is not inherently a vulnerability.',cmd:(h,port)=>`nmap -Pn -n -sV -p ${port} -oX oac-${h}-${port}-dns.xml ${h}`},
+ {id:'data',ports:[1433,1521,3306,5432,6379,27017],key:'data',name:'Database exposure baseline',tool:'Nmap version detection',risk:'Low',why:'Confirm the listener and ask whether this subnet should reach it; no authentication bypass.',expect:'Exposure finding only if validated against intended network rules.',cmd:(h,port)=>`nmap -Pn -n -sV --version-light -p ${port} -oX oac-${h}-${port}-db.xml ${h}`}
+];
+const FO_FINDING_META = {
+ 'ftp-anon':{title:'Anonymous FTP login appears permitted',severity:'medium',impact:'An unauthenticated user may access FTP resources exposed to this network; actual file permissions remain unverified.',remediation:'Disable anonymous FTP unless specifically required. Restrict access and review directory permissions.',verify:'Perform read-only directory listing with the approved test account; do not retrieve private files.',poc:(h,port)=>`curl --max-time 10 --user anonymous:anonymous "ftp://${h}:${port}/"`},
+ 'smb-signing':{title:'SMB signing not required',severity:'medium',impact:'Depending on network controls, an attacker may have additional opportunities to relay SMB authentication. No relay exploit has been demonstrated.',remediation:'Require SMB signing on appropriate systems and apply network protections. Confirm compatibility.',verify:'Confirm the same result against the exact affected host and review configured Windows SMB signing policy.',poc:(h,port)=>`nmap -Pn -n -p ${port} --script smb2-security-mode ${h}`},
+ 'legacy-tls':{title:'Legacy TLS protocol appears supported',severity:'medium',impact:'Legacy protocol support may permit weaker connections depending on negotiated settings and clients.',remediation:'Disable TLS 1.0/1.1 where feasible; enforce modern TLS and approved cipher policy.',verify:'Confirm negotiated protocols with the service owner or an approved TLS configuration scan.',poc:(h,port)=>`nmap -Pn -n -p ${port} --script ssl-enum-ciphers ${h}`},
+ 'http-methods':{title:'Potentially risky HTTP methods advertised',severity:'low',impact:'PUT or DELETE may permit changes if application authorization controls are weak; the HTTP OPTIONS result alone does not show that.',remediation:'Review and restrict methods to application requirements; enforce per-resource authorization.',verify:'Check authorized policy and application behavior; do not send state-changing test requests outside an isolated lab.',poc:(h,port)=>`curl --max-time 10 -i -X OPTIONS "http://${h}:${port}/"`},
+ 'http-headers':{title:'Security response headers appear absent',severity:'low',impact:'Missing defensive headers may increase certain web risks, depending on application context.',remediation:'Assess CSP, X-Content-Type-Options, frame policy and HTTPS-related headers for the application.',verify:'Inspect actual HTTP responses and confirm which headers apply to this application.',poc:(h,port)=>`curl --max-time 10 -I "http://${h}:${port}/"`},
+ 'nikto-header':{title:'Web header observation needs review',severity:'low',impact:'Nikto reported a potential missing protective header; confirm relevance on the actual app.',remediation:'Review web response header policy and implement applicable defensive headers.',verify:'Confirm with a direct header request and manual review.',poc:(h,port)=>`curl --max-time 10 -I "http://${h}:${port}/"`}
+};
+function foDefaults(p){if(!p.fieldops)p.fieldops={managementIp:'172.16.24.1',adapter:'eth0',notes:'',payloadSettings:{},importSummary:[],nextId:'',lastImport:''};if(!p.evidenceChecks)p.evidenceChecks=[];}
+function foHelp(text){return `<div class="fo-help">${e(text)}</div>`;}
+function foPanel(title,subtitle,body,kicker='GUIDED WORKFLOW'){return `<section class="panel fo-panel"><div class="panel-header"><div><div class="section-kicker">${e(kicker)}</div><h2 class="panel-title">${e(title)}</h2><p class="panel-desc">${e(subtitle)}</p></div></div>${body}</section>`;}
+function foStep(title,body,number){return `<div class="fo-instruction"><span class="fo-stepnum">${e(String(number).padStart(2,'0'))}</span><div><b>${e(title)}</b><p>${body}</p></div></div>`;}
+function foCommand(name,text,why,host,p){const ready=scopeSafety(p)&&(!host||isInScope(host,p.scope));return `<div class="cmd-card fo-command"><div class="cmd-top"><div><div class="cmd-title">${e(name)}</div><div class="cmd-note">${e(why)}</div></div><button type="button" class="btn small-btn ghost" data-fo-copy="${e(host||'LOCAL')}" data-fo-command="${e(text)}" ${ready?'':'disabled'}>Copy</button></div><pre class="command-text">${e(text)}</pre></div>`;}
+function foStatus(message,kind='info'){return `<div class="callout ${kind}">${message}</div>`}
+function foCard(title,sub,body){return `<div class="fo-card"><div class="fo-card-title">${e(title)}</div><p class="small">${e(sub)}</p>${body}</div>`;}
+function foAsset(p){return p.assets.find(a=>a.id===ui.assetId)||p.assets[0]||null;}
+function foChecks(a){return (a?.ports||[]).filter(s=>(!s.state||s.state==='open')&&s.protocol!=='udp').flatMap(s=>FO_KNOWN.filter(c=>c.ports.includes(Number(s.port))).map(c=>({...c,host:a.host,port:s.port,service:s.service,version:s.version||''})));}
+function foAllChecks(p){return p.assets.filter(a=>isInScope(a.host,p.scope)).flatMap(foChecks);}
+function foSourceLabel(p,id){const s=p.sources.find(x=>x.id===id);return s?`${s.name} · SHA-256 ${s.sha.slice(0,12)}…`:'Imported evidence';}
+function foFindingFor(p,h,kind){return p.findings.find(f=>f.host===h&&f.autoKind===kind&&f.status!=='disproved')||null;}
+function foQuery(p,a,check){return (p.evidenceChecks||[]).filter(x=>x.host===a.host&&x.port===check.port&&x.checkKey===check.key);}
+function foContext(p,stepsOnly=false){foDefaults(p);const count=foAllChecks(p).length;return `<div class="fo-context"><div><span class="fo-k">ASSETS</span><b>${p.assets.length}</b></div><div><span class="fo-k">SERVICE CHECKS</span><b>${count}</b></div><div><span class="fo-k">EVIDENCE CHECKS</span><b>${p.evidenceChecks.length}</b></div><div><span class="fo-k">AUTO FINDINGS</span><b>${p.findings.filter(f=>f.autoKind).length}</b></div>${stepsOnly?'':`<div><span class="fo-k">CONTROLLED TESTS</span><b>${p.tests.length}</b></div>`}</div>`;}
+
+const foOldRecon = recon;
+recon = function(p){foDefaults(p);
+ const base=foOldRecon(p);
+ const cut=base.indexOf('<section class="panel"><div class="panel-header"><div><div class="section-kicker">KALI FIRST STEPS');
+ const scopeSection=cut>=0?base.slice(0,cut):'';
+ const stored=p.fieldops.payloadSettings||{};
+ const cards=FO_PAYLOADS.map((q,i)=>{const saved=stored[q.id]||{};const config=q.params.map(([label,value])=>`<div class="fo-setting"><span>${e(label)}</span><strong>${e(value)}</strong></div>`).join('');return `<details class="fo-payload" ${i===0?'open':''}><summary><div><span class="fo-order">${String(i+1).padStart(2,'0')}</span> <b>${e(q.name)}</b><span class="fo-chip">${e(q.risk)}</span></div><span class="tiny">Expand procedure ▾</span></summary><div class="fo-detail"><p>${e(q.purpose)}</p>${foStatus(`<b>Exact menu name:</b> ${e(q.name)} · ${e(q.confidence)}. <b>Settings below are operator starting suggestions, not verified firmware defaults.</b> Only enter fields your installed payload actually presents.`)}<div class="fo-setting-grid">${config}</div><div class="fo-payload-row"><div><b>Recommended target:</b> ${e(q.target)}</div><div><b>Write down:</b> ${e(q.expect)}</div><div><b>Loot expectation:</b> ${e(q.loot)}</div><div><b>Then:</b> ${e(q.next)}</div></div><form class="fo-payload-form" data-fo-form="payload" data-fo-id="${e(q.id)}"><div class="form-grid"><div class="field"><label>Actual value(s) entered on your Shark Jack</label><input name="settings" value="${e(saved.settings||'')}" placeholder="Target=10.10.10.1; timeout=2s; count=4"></div><div class="field"><label>Observed result</label><select name="result"><option>Saved loot</option><option>Success (no file)</option><option>No response</option><option>Failed</option><option>Unknown</option></select></div><div class="field full"><label>Actual loot filename / screen result</label><input name="notes" placeholder="e.g. network_hunter_2026-10-13...txt"></div></div><button class="btn small-btn primary" type="submit">Save payload run + settings</button></form></div></details>`}).join('');
+ return scopeSection+foContext(p)+foPanel('The exact Shark Jack procedure','Four payloads identified from your own workflow; settings are specific suggested starting points and should be checked against the installed profile.',`
+ ${foStep('Verify scope and NETMODE',`Only test networks you own or have written approval for. On a normal LAN with an existing DHCP server, use <code>DHCP_CLIENT</code>, not <code>DHCP_SERVER</code>.`,1)}
+ ${foStep('Run the four payloads in order',`Start with connectivity and a known ping target; use discovery and broader scan only when the earlier stages succeed and the network range is approved.`,2)}
+ ${foStep('Record the actual on-device options',`Timeout and field labels can change by installed script. Record the values you truly used in each card; never claim a suggested value was observed.`,3)}
+ <div class="fo-payload-list">${cards}</div>
+ <div class="actions-row"><a href="https://github.com/hak5/sharkjackdisplay-payloads" target="_blank" rel="noopener noreferrer" class="btn small-btn">Official Display payload library ↗</a><button class="btn small-btn" data-action="log-payload">+ Other installed payload</button></div>
+ ${foStatus('<b>Not every payload saves loot.</b> Inspect the on-device payload log. “Completed” does not establish that a scan was successful. Do not use capture, credential collection, or off-network exfiltration payloads as part of a routine discovery assessment.','warn')}`,'DEVICE OPERATOR GUIDE')+
+ foPanel('Kali first: confirm your network','Run these from the Kali terminal after connecting to the correct adapter.',[
+ {name:'Kali adapter and IP',text:'ip -br address',why:'Find wlan0/eth0 and addresses.'},
+ {name:'Current route',text:'ip route',why:'Confirm the default gateway.'},
+ {name:'Authorized host discovery',text:`sudo nmap -sn -n --max-retries 1 --host-timeout 60s ${validScope(p.scope)?p.scope:'YOUR_APPROVED_SUBNET'}`,why:'Find responding hosts only in recorded scope.'}
+ ].map(c=>foCommand(c.name,c.text,c.why,null,p)).join(''),'TERMINAL PRACTICE')+
+ foPanel('Payload history','Entries you saved on your Shark Jack cards; these survive encrypted lock/unlock.',`<div class="item-list">${p.runs.map(r=>`<div class="item"><div class="item-name">${e(r.name)} <span class="fo-chip">${e(r.result)}</span></div><div class="small">${e(date(r.at))} · ${e(r.target||'Unspecified')} · ${e(r.notes||'No file noted')}</div></div>`).join('')||'<div class="empty">No runs logged yet.</div>'}</div><div class="actions-row"><button type="button" class="btn primary" data-phase="1">Next → Retrieve loot in Enumeration</button></div>`,'YOUR EVIDENCE TRAIL');
+};
+
+const foOldEnumeration=enumeration;
+enumeration = function(p){foDefaults(p);const ip=p.fieldops.managementIp||'172.16.24.1';const a=foAsset(p);const saved=foAllChecks(p);const linux=[
+ {name:'1. Confirm your local interface',text:'ip -br address',why:'Identify the Ethernet adapter connected to the Shark Jack management port.'},
+ {name:'2. Check the device management address',text:`ping -c 2 -W 2 ${ip}`,why:'A ping failure does not prove SSH is unavailable; check arming-mode configuration.'},
+ {name:'3. Connect to the Shark Jack',text:`ssh root@${ip}`,why:'Run in Kali Terminal; confirm the management IP from the device, accept only the expected host key.'},
+ {name:'4. Inspect filenames on the device',text:`ssh root@${ip} 'find /root/loot -maxdepth 4 -type f -print'`,why:'Run from your Kali terminal, not inside an already open SSH session.'},
+ {name:'5. Create your local evidence directory',text:'mkdir -p "$HOME/FieldOps-Loot"',why:'Stores copied data in your home directory on Kali.'},
+ {name:'6. Copy the entire loot folder',text:`scp -r root@${ip}:/root/loot "$HOME/FieldOps-Loot/"`,why:'From a local Kali terminal, download only the Shark Jack scan outputs you are authorized to retain.'},
+ {name:'7. Confirm copied results',text:'find "$HOME/FieldOps-Loot" -maxdepth 5 -type f -print',why:'Shows exact filenames ready to import here.'}];
+ const win=[
+ {name:'1. Check interface address',text:'ipconfig',why:'In PowerShell, find the Ethernet adapter attached to the Shark Jack.'},
+ {name:'2. Test management connectivity',text:`Test-NetConnection ${ip} -Port 22`,why:'Check whether SSH is reachable from Windows.'},
+ {name:'3. Inspect the Shark Jack loot directory',text:`ssh root@${ip} "find /root/loot -maxdepth 4 -type f -print"`,why:'Run from PowerShell on Windows; the remote path is on the Shark Jack.'},
+ {name:'4. Make a Windows evidence directory',text:'New-Item -ItemType Directory -Force -Path "$HOME\\Documents\\FieldOps-Loot"',why:'Creates your local destination if missing.'},
+ {name:'5. Transfer the loot directory',text:`scp -r root@${ip}:/root/loot "$HOME\\Documents\\FieldOps-Loot\\"`,why:'Run from your local PowerShell, not from the SSH session.'},
+ {name:'6. Check transferred files',text:'Get-ChildItem -Recurse "$HOME\\Documents\\FieldOps-Loot" -File | Select-Object FullName,Length',why:'View downloaded evidence filenames and sizes.'}
+ ];
+ const os=ui.foOS||'kali';
+ const back=foPanel('Retrieve Shark Jack results over SSH / SCP','Exact copy-and-paste commands for Kali or Windows. “Loot” means saved Shark Jack output—not arbitrary endpoint files.',`
+ <form data-fo-form="management" class="form-grid"><div class="field"><label>Shark Jack management IPv4 (verify on device)</label><input required name="ip" value="${e(ip)}" placeholder="172.16.24.1"></div><div class="field"><label>Host OS for transfer steps</label><select id="fo-os"><option value="kali" ${os==='kali'?'selected':''}>Kali / Linux</option><option value="windows" ${os==='windows'?'selected':''}>Windows PowerShell</option></select></div><div class="field full"><button class="btn small-btn" type="submit">Save management IP</button></div></form>
+ ${foStep('Set device to Arming / management mode',`Connect to your laptop using the management interface and make sure the local network adapter can reach the device. <b>172.16.24.1 is a common Shark Jack address, not a guarantee for your Display configuration.</b>`,1)}
+ ${foStep('Run the steps in a local terminal',`An SSH session runs commands <em>on the Shark Jack</em>; an <code>scp</code> command downloads to <em>your local machine</em>. If you are at a <code>root@shark:</code> prompt, type <code>exit</code> before SCP.`,2)}
+ <div class="fo-transfer-list">${(os==='kali'?linux:win).map(x=>foCommand(x.name,x.text,x.why,null,p)).join('')}</div>
+ ${foStatus('If <code>find</code> reports no files: the payload may not save output. Capture its on-device result or generate an authorized Nmap XML scan in Kali instead. Before importing, remove credentials, tokens, user data and packet payloads.','warn')}`,'EVIDENCE TRANSFER')+
+ foPanel('Bring the outputs back and parse automatically','Import XML or plain-text scan output. FieldOps identifies hosts, ports and selected NSE evidence and carries the result forward.',`
+ <div class="form-grid"><form id="import-form" class="field full"><label>Choose result files</label><input name="files" type="file" accept=".xml,.txt,.log,.nmap,.gnmap,.csv" multiple required><button type="submit" class="btn primary fo-upload">Import files and analyze →</button></form>
+ <form data-fo-form="paste" class="field full"><label>Or paste copied terminal output</label><textarea name="output" minlength="8" maxlength="500000" required placeholder="Nmap scan report for 10.10.20.10...&#10;PORT   STATE SERVICE...&#10;445/tcp open microsoft-ds"></textarea><button type="submit" class="btn small-btn">Parse pasted output</button></form></div>
+ <div class="notice">Best format: <code>nmap -sV -oX result.xml 10.10.20.10</code>. For vulnerability checks, keep <code>-oX</code>; NSE script output is parsed to create suspected findings only when it contains a relevant observed result.</div>`,'AUTOMATED INGESTION')+
+ foPanel('Evidence and discovered inventory','Every import is SHA-256 hashed. Existing files are deduplicated. No raw file contents are stored in the encrypted workspace.',`
+ ${foContext(p)}${assetsTable(p)}<div class="actions-row"><button class="btn small-btn" data-action="add-port">+ Add service manually</button><button class="btn primary" data-phase="2">Next → Vulnerability Assessment (${saved.length} checks)</button></div><div class="item-list">${p.sources.slice(0,12).map(s=>`<div class="item"><div class="item-name">${e(s.name)}</div><div class="tiny">${e(date(s.at))} · ${e(s.count)} observed ports · SHA-256 ${e(s.sha)}</div></div>`).join('')||'<div class="empty">No files imported.</div>'}</div>`,'OBSERVED EVIDENCE');
+ return back;
+};
+
+const foOldVulnerability=vulnerability;
+vulnerability = function(p){foDefaults(p);const a=foAsset(p);const checks=foAllChecks(p);const focus=a||null;
+ const tasks=checks.map(c=>{const evidence=(p.evidenceChecks||[]).filter(x=>x.host===c.host&&x.port===c.port&&x.checkKey===c.key);
+ const f=p.findings.find(x=>x.host===c.host&&x.autoPort===c.port&&x.autoKind);
+ return `<div class="fo-check"><div class="fo-check-header"><div><b>${e(c.host)}:${e(c.port)} · ${e(c.name)}</b><div class="small">${e(c.service||'Unknown service')}${c.version?' · '+e(c.version):''} · ${e(c.tool)}</div></div><span class="fo-chip">${e(c.risk)}</span></div><p class="small">${e(c.why)}</p>${foCommand('Run in Kali → save as XML',c.cmd(c.host,c.port),c.expect,c.host,p)}<p class="tiny">${e(c.expect)}</p><div class="fo-check-outcome">${evidence.length?`<span class="fo-good">✓ ${evidence.length} matching script observation(s) imported</span>`:'<span class="fo-pending">○ Awaiting targeted output</span>'}${f?`<span class="fo-chip">Finding: ${e(f.status)} · ${e(f.title)}</span>`:''}</div></div>`}).join('');
+ const findings=p.findings.filter(f=>!ui.filter||ui.filter==='all'||f.status===ui.filter);
+ return foContext(p)+foPanel('Auto-generated vulnerability investigation queue','Generated from imported ports and services. Each command targets only the actual observed host and port; import the XML to link the results.',`
+ ${checks.length?`<div class="fo-check-list">${tasks}</div>`:foStatus('No in-scope open services found yet. Import a Shark Jack or Nmap scan in Phase 02. An open port is a starting point, not a vulnerability.')}
+ <div class="actions-row"><button class="btn primary" data-phase="1">← Import Nmap check output</button><button class="btn small-btn" data-phase="3">Next → Controlled validation / exploitation</button></div>`,'SERVICE-TO-TOOL ENGINE')+
+ foPanel('Evidence-driven findings (automatically carried forward)','Imported Nmap script observations can create suspected findings. You review and promote or dismiss them; FieldOps never declares compromise based on a banner.',`
+ ${findings.length?findings.map(f=>`<div class="fo-finding"><div class="fo-finding-title"><b>${e(f.title)}</b> <span class="tag ${f.status==='validated'?'green':f.status==='disproved'?'muted':'yellow'}">${e(f.status)}</span></div><div class="small">${e(f.host)}${f.autoPort?':'+e(f.autoPort):''} · ${e(f.severity||'unrated')} · ${f.autoKind?'Auto-detected candidate':'Practitioner entry'}</div><div class="fo-evidence">${e(f.evidence||'No evidence entered')}</div><div class="tiny">${e(f.sourceLabel||'Evidence source must be reviewed')}</div><div class="actions-row"><button type="button" class="btn small-btn" data-fo-review="${e(f.id)}">Review / validate</button><button type="button" class="btn small-btn" data-fo-exploit="${e(f.id)}">Carry into Exploitation →</button></div></div>`).join(''):'<div class="empty">No suspected vulnerabilities yet. Import check output, not just open-port results; clean scans may create no findings.</div>'}
+ <details class="fo-expand"><summary>+ Manually record a finding not covered by the parser</summary><form id="finding-form" class="form-grid" style="margin-top:15px"><div class="field"><label>Finding title</label><input name="title" required maxlength="130" placeholder="Describe the actual observed weakness"></div><div class="field"><label>Target IP</label><input name="host" required value="${e(focus?.host||'')}"></div><div class="field"><label>Severity</label><select name="severity"><option value="info">Informational</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></div><div class="field"><label>State</label><select name="status"><option value="suspected">Suspected</option><option value="validated">Validated</option><option value="disproved">Disproved</option></select></div><div class="field full"><label>Actual evidence</label><textarea name="evidence" required></textarea></div><div class="field full"><label>Impact</label><textarea name="impact"></textarea></div><div class="field full"><label>Remediation</label><textarea name="remediation"></textarea></div><button class="btn primary" type="submit">Save manual finding</button></form></details>`,'REVIEW QUEUE')+
+ foPanel('How to interpret the output','Keep this decision rule in mind as you move from Kali scanners to risk.',`
+ <div class="flow-cards"><div class="flow-card"><div class="n">OBSERVED</div><div class="t">445/tcp open</div><div class="d">This proves an SMB listener responded. It is not a weakness by itself.</div></div><div class="flow-card"><div class="n">SUSPECTED</div><div class="t">Signing not required</div><div class="d">An imported NSE script suggests a configuration weakness.</div></div><div class="flow-card"><div class="n">VALIDATED</div><div class="t">Verified against policy</div><div class="d">Assessor confirms applicability and records direct evidence.</div></div></div>
+ ${foStatus('Nmap XML parsing recognizes selected SMB signing, FTP anonymous login, legacy TLS, and HTTP method/header indicators. Unknown scanner outputs are retained only as hash metadata until you review them. Vulnerability scanners can produce false positives.','warn')}`,'INTERPRETING RISK');
+};
+
+function foSelectedFinding(p){return p.findings.find(f=>f.id===ui.foFinding)||p.findings.find(f=>f.status==='validated')||p.findings.find(f=>f.status==='suspected')||null;}
+function foMethod(f){if(!f)return null;return FO_FINDING_META[f.autoKind]||null;}
+const foOldExploitation=exploitation;
+exploitation = function(p){foDefaults(p);const f=foSelectedFinding(p), meta=foMethod(f);const ready=f&&isInScope(f.host,p.scope)&&p.exploitApproved&&f.status==='validated';const port=f?.autoPort|| (p.assets.find(a=>a.host===f?.host)?.ports?.[0]?.port)||'PORT';
+ const preceding=p.findings.map(x=>`<option value="${e(x.id)}" ${x.id===f?.id?'selected':''}>${e(x.title)} · ${e(x.host)} · ${e(x.status)}</option>`).join('');
+ return foContext(p)+foPanel('Findings from vulnerability assessment','Choose an imported or validated weakness. The walkthrough below changes based on which finding is selected.',`
+ ${p.findings.length?`<div class="field"><label>Finding to investigate</label><select id="fo-finding-select"><option value="">Select a finding…</option>${preceding}</select></div>`:'<div class="empty">No findings yet. Run and import service-specific checks in Phase 03. A discovered port alone must not become an exploit.</div>'}
+ ${f?`<div class="fo-finding"><div class="fo-finding-title"><b>${e(f.title)}</b> <span class="tag ${f.status==='validated'?'green':'yellow'}">${e(f.status)}</span></div><div class="small">${e(f.host)}:${e(port)} · ${e(f.severity)} · ${e(f.autoKind||'Manual assessment')}</div><div class="fo-evidence">${e(f.evidence||'No evidence recorded')}</div><div class="tiny">${e(f.sourceLabel||'Review evidence integrity and scope')}</div></div>`:''}
+ ${!f?'':f.status!=='validated'?foStatus('<b>Not yet validated.</b> Return to Vulnerability Assessment to verify the finding and mark its correct status. A scanner suggestion alone does not justify exploitation.','warn'):!p.exploitApproved?foStatus('<b>Authorization missing:</b> Explicit exploitation approval has not been recorded. You can review the plan, but test commands are withheld until it is approved.','warn'):foStatus('<b>Controlled testing gate passed:</b> Verify the stated objective, asset, evidence, rollback and stop conditions before any test.','ok')}`,'LINKED FINDING')+
+ foPanel('Safe controlled proof — customized to your result','A decision aid for authorized lab validation, not automated exploit execution.',`
+ ${f?`<div class="fo-instruction"><span class="fo-stepnum">01</span><div><b>What we know</b><p>${e(f.title)} was recorded for ${e(f.host)}. Evidence status: ${e(f.status)}. ${e(meta?.impact||'Confirm the affected product, version, prerequisites, and vendor guidance.')}</p></div></div>
+ ${foStep('What to verify first',e(meta?.verify||'Find the matching vendor advisory or lab walkthrough and verify the exact affected version and preconditions. Do not assume an Nmap version string is enough.'),2)}
+ ${foStep('Define your stop condition',`Stop once the minimum approved result is visible. Do not collect credentials, browse personal records, establish persistence or perform lateral movement during this guided test.`,3)}
+ ${meta?foCommand('Minimal read-only validation / proof',meta.poc(f.host,port),`For approved labs only. ${meta.verify}`,f.host,{...p,authorized:ready}):foStatus('No generic copy-and-run exploit exists for this finding. Research a verified advisory and plan the minimal proof on a disposable lab snapshot. Do not blindly run public exploit code.','warn')}
+ ${foStep('Record observed outcome and cleanup',`Select the exact linked finding below and record what actually happened. This flows automatically into Phase 05 and the report.`,4)}
+ ${foStatus('SMB signing, weak TLS, or missing web headers may be configuration findings with <b>no appropriate exploit demonstration</b> in your assessment. A validated configuration issue can be reported without gaining access.','warn')}`:'<div class="empty">Choose a finding first.</div>'}`,'CONTROLLED TEST PLAYBOOK')+
+ foPanel('Authorization and test record','The existing test log stays part of your encrypted engagement. A confirmed proof requires approval and an in-scope target.',`
+ <form id="approval-form" style="margin-bottom:18px"><label class="check-row"><input type="checkbox" name="exploitApproved" ${p.exploitApproved?'checked':''}> <span>Written permission specifically authorizes controlled exploitation of selected assets and methods.</span></label><button class="btn small-btn" type="submit">Save approval status</button></form>
+ <form id="test-form" class="form-grid"><div class="field full"><label>Linked finding</label><select name="findingId"><option value="">No linked finding</option>${p.findings.filter(x=>x.status==='validated').map(x=>`<option value="${e(x.id)}" ${x.id===f?.id?'selected':''}>${e(x.title)} · ${e(x.host)}</option>`).join('')}</select></div><div class="field"><label>Test host</label><input name="host" required value="${e(f?.host||'')}"></div><div class="field"><label>Observed outcome</label><select name="result"><option>Not attempted</option><option>Blocked — no authorization</option><option>Inconclusive</option><option>Not vulnerable</option><option>Proof confirmed</option></select></div><div class="field full"><label>Objective</label><input name="objective" value="${e(f?'Check: '+f.title:'')}" required></div><div class="field full"><label>Method, approved boundaries and stop condition</label><textarea name="method">${e(meta?.verify||'')}</textarea></div><div class="field full"><label>Actual sanitized proof / why it failed</label><textarea name="evidence"></textarea></div><div class="field full"><label>Cleanup performed</label><textarea name="cleanup" placeholder="No changes made / sessions closed / test artifacts removed"></textarea></div><button type="submit" class="btn primary">Save linked test record →</button></form>
+ <div class="item-list" style="margin-top:15px">${p.tests.map(t=>`<div class="item"><div class="item-name">${e(t.objective)} <span class="fo-chip">${e(t.result)}</span></div><p class="small">${e(t.host)} · ${e(t.evidence||t.method||'No evidence')}</p></div>`).join('')||'<div class="empty">No test records yet.</div>'}</div><div class="actions-row"><button class="btn primary" data-phase="4">Next → Post-exploitation / Cleanup</button></div>`,'APPROVAL & EVIDENCE');
+};
+const foOldPost=postExploit;
+postExploit = function(p){foDefaults(p);const items=p.tests.map(t=>{const f=p.findings.find(x=>x.id===t.findingId);return `<div class="fo-finding"><div class="fo-finding-title"><b>${e(f?.title||t.objective)}</b> <span class="fo-chip">${e(t.result)}</span></div><div class="small">${e(t.host)} · ${e(date(t.at))}</div><div class="fo-evidence">${e(t.evidence||'Proof not recorded')}${t.cleanup?' · Cleanup: '+e(t.cleanup):''}</div></div>`}).join('');
+ return foContext(p)+foPanel('Automatic post-exploitation handoff','Each controlled test from Phase 04 appears below with its linked finding, actual proof and cleanup status.',`
+ ${items||'<div class="empty">No proof records. If exploitation was skipped, document that and proceed directly to reporting.</div>'}
+ ${foStatus('Only assess the access your permitted test actually demonstrated. No automated persistence, credential harvesting, data dumping or pivoting is built into FieldOps.','warn')}`,'FINDING → OUTCOME')+
+ foOldPost(p)+foPanel('Closure and reporting handoff','Exploitation may be skipped; accurate limitations are more useful than invented proof.',`<div class="actions-row"><button class="btn primary" data-phase="5">Next → Generate report</button></div>`,'NEXT PHASE');
+};
+const foOldReport=report;
+report = function(p){foDefaults(p);const confirmed=p.findings.filter(f=>f.status==='validated').length;const suspected=p.findings.filter(f=>f.status==='suspected').length;const denied=p.findings.filter(f=>f.status==='disproved').length;const sample=`Assessment of ${p.scope} identified ${p.assets.length} host(s) and ${allPorts(p)} open service(s). ${confirmed} finding(s) validated, ${suspected} require verification, and ${denied} were disproved. ${p.tests.length} controlled test record(s). Only observed and verified results are reported as proven.`;
+ return foContext(p)+foPanel('Report narrative based on real evidence','Use this factual starter summary. Final severity and business impact still require an assessor’s judgment.',`<div class="fo-evidence">${e(sample)}</div><div class="actions-row"><button type="button" class="btn small-btn" data-fo-summary="${e(sample)}">Use summary draft in report form</button></div>${foStatus('Findings marked “suspected” remain unconfirmed. Importing scan output never establishes exploitation. Verify all severity claims before presenting a report.','warn')}`,'AUTO-ASSEMBLED CONTEXT')+foOldReport(p);
+};
+
+function foDetection(scriptId,output){const id=(scriptId||'').toLowerCase(),v=(output||'').toLowerCase();
+ if(id==='ftp-anon'&&/anonymous ftp login allowed|anonymous login allowed/.test(v))return 'ftp-anon';
+ if(id==='smb2-security-mode'&&/(message signing enabled but not required|signing.*not required|message signing.*disabled)/.test(v))return 'smb-signing';
+ if(id==='ssl-enum-ciphers'&&((/(tlsv1\.0|tlsv1\.1|sslv3)\s*:/i.test(v))||(/(tlsv1\.0|tlsv1\.1|sslv3)\s+supported/i.test(v)&&!/(not|unsupported)\s+(tlsv1\.0|tlsv1\.1|sslv3)/i.test(v))))return 'legacy-tls';
+ if(id==='http-methods'&&/potentially risky methods:[^\n]*(put|delete|trace)/i.test(v))return 'http-methods';
+ if(id==='http-security-headers'&&/(missing|not set|not present).{0,70}(content-security-policy|x-frame-options|x-content-type-options)/i.test(v))return 'http-headers';
+ return null;
+}
+function foRedact(s){return String(s||'').replace(/(authorization:\s*(?:basic|bearer)\s+)[^\s]+/gi,'$1[REDACTED]').replace(/((?:api[_-]?key|token|password|secret)["'=:\s]+)[^\s"']+/gi,'$1[REDACTED]').slice(0,900)}
+function foParseNSE(text,name){const out=[];const push=(host,port,script,raw)=>{if(!validIPv4(host)||!Number.isInteger(+port)||+port<1||+port>65535)return;out.push({host,port:+port,checkKey:script,output:foRedact(raw),kind:foDetection(script,raw),filename:name})};
+ const isXml=/^\s*(<\?xml|<nmaprun[\s>])/i.test(text);
+ if(isXml){const x=new DOMParser().parseFromString(text,'application/xml');if(x.querySelector('parsererror'))return out;
+  for(const h of x.querySelectorAll('nmaprun > host')){const ip=[...h.querySelectorAll(':scope > address')].find(y=>y.getAttribute('addrtype')==='ipv4')?.getAttribute('addr');if(!validIPv4(ip||''))continue;
+   for(const port of h.querySelectorAll(':scope > ports > port')){const num=+port.getAttribute('portid');for(const s of port.querySelectorAll(':scope > script'))push(ip,num,s.getAttribute('id')||'',s.getAttribute('output')||s.textContent||'')}
+   for(const script of h.querySelectorAll(':scope > hostscript > script')){const sid=script.getAttribute('id')||'';if(sid.startsWith('smb')&&h.querySelector('port[portid="445"]'))push(ip,445,sid,script.getAttribute('output')||script.textContent||'');}
+  }
+  return out;
+ }
+ let host='',port=0,script='',buf=[];
+ const flush=()=>{if(host&&port&&script)push(host,port,script,buf.join('\n'));script='';buf=[]};
+ for(const raw of text.split(/\r?\n/)){
+  let m=raw.match(/^Nmap scan report for\s+(?:(.*?)\s+\()?((?:\d{1,3}\.){3}\d{1,3})\)?\s*$/i);
+  if(m){flush();host=m[2];port=0;continue}
+  m=raw.match(/^\s*(\d{1,5})\/(?:tcp|udp)\s+(?:open|filtered)\s+/i);
+  if(m){flush();port=+m[1];continue}
+  m=raw.match(/^\s*\|[_ ]?([a-z][\w-]+):\s*(.*)$/i);
+  if(m){flush();script=m[1];buf.push(m[2]||'');continue}
+  if(script&&/^\s*\|/.test(raw)){buf.push(raw.replace(/^\s*\|[_ ]?/,''));continue}
+  if(script&&!/^\s*\|/.test(raw)&&raw.trim()){flush()}
+ }
+ flush();
+ return out;
+}
+const foBaseImportFiles=importFiles;
+importFiles=async function(p,files){foDefaults(p);const start=new Set(p.sources.map(s=>s.sha));const gathered=[];
+ for(const file of files){if(file.size>2*1024*1024)throw Error(file.name+' exceeds the 2MB parser limit.');const buf=await file.arrayBuffer();const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',buf))).map(x=>x.toString(16).padStart(2,'0')).join('');if(start.has(hash))continue;gathered.push({name:file.name,sha:hash,checks:foParseNSE(dec.decode(buf),file.name)})}
+ await foBaseImportFiles(p,files);
+ let observations=0,candidates=0;
+ for(const file of gathered){const src=p.sources.find(s=>s.sha===file.sha);if(!src)continue;
+  for(const check of file.checks){if(!isInScope(check.host,p.scope))continue;
+   if(p.evidenceChecks.some(x=>x.host===check.host&&x.port===check.port&&x.checkKey===check.checkKey&&x.sha===file.sha))continue;
+   p.evidenceChecks.unshift({id:id(),host:check.host,port:check.port,checkKey:check.checkKey,output:check.output.slice(0,500),kind:check.kind,sourceId:src.id,sha:file.sha,at:time()});observations++;
+   if(check.kind){const meta=FO_FINDING_META[check.kind];if(!meta)continue;
+    const existing=p.findings.find(f=>f.host===check.host&&f.autoPort===check.port&&f.autoKind===check.kind);
+    if(!existing){p.findings.unshift({id:id(),at:time(),title:meta.title,host:check.host,autoPort:check.port,autoKind:check.kind,severity:meta.severity,status:'suspected',evidence:`${check.checkKey}: ${check.output.slice(0,420)}`,sourceLabel:`${src.name} / SHA-256 ${file.sha}`,impact:meta.impact,remediation:meta.remediation});candidates++}
+    else if(existing.status==='suspected'){existing.evidence=existing.evidence||`${check.checkKey}: ${check.output.slice(0,420)}`}
+   }
+  }
+ }
+ p.evidenceChecks=p.evidenceChecks.slice(0,1200);
+ p.fieldops.lastImport=time();log(p,`Linked ${observations} scripted check(s); ${candidates} new suspected finding(s)`);await persist();render();message(`${observations} scripted observations; ${candidates} suspected findings created. Review in Phase 03.`);
+};
+
+// Capture these new forms before the original v1 handler. All results are stored in the same AES-GCM vault.
+document.addEventListener('submit',async ev=>{const f=ev.target;if(!(f instanceof HTMLFormElement)||!f.dataset.foForm)return;
+ ev.preventDefault();ev.stopImmediatePropagation();if(ui.busy)return;ui.busy=true;
+ try{const p=current();if(!p)throw Error('Unlock your workspace first.');foDefaults(p);const d=Object.fromEntries(new FormData(f));
+  if(f.dataset.foForm==='management') {const ip=String(d.ip||'').trim();if(!validIPv4(ip))throw Error('Enter a valid management IPv4 address.');p.fieldops.managementIp=ip;await commit('Updated verified management IP');}
+  else if(f.dataset.foForm==='payload'){const q=FO_PAYLOADS.find(x=>x.id===f.dataset.foId);if(!q)throw Error('Unknown payload.');const settings=String(d.settings||'').trim().slice(0,350);const result=String(d.result||'Unknown');const notes=String(d.notes||'').slice(0,400);p.fieldops.payloadSettings[q.id]={settings};p.runs.unshift({id:id(),name:q.name,target:settings,result,notes,at:time()});await commit(`Logged ${q.name} with actual settings`)}
+  else if(f.dataset.foForm==='paste'){const text=String(d.output||'').trim();if(text.length<8)throw Error('Paste at least eight characters of output.');const file=new File([text],`terminal-${today()}-${Date.now()}.txt`,{type:'text/plain'});await importFiles(p,[file]);}
+ }catch(err){fail(err)}finally{ui.busy=false}
+},true);
+
+document.addEventListener('change',ev=>{const node=ev.target;if(node?.id==='fo-os'){ev.stopImmediatePropagation();ui.foOS=node.value;render();}
+ else if(node?.id==='fo-finding-select'){ev.stopImmediatePropagation();ui.foFinding=node.value;render();}
+},true);
+
+document.addEventListener('click',async ev=>{const b=ev.target.closest?.('[data-fo-copy],[data-fo-review],[data-fo-exploit],[data-fo-summary]');if(!b)return;
+ ev.preventDefault();ev.stopImmediatePropagation();const p=current();if(!p)return;
+ try{
+  if(b.dataset.foCopy!==undefined){const host=b.dataset.foCopy;if(!scopeSafety(p))throw Error('Save your approved scope first.');if(host!=='LOCAL'&&!isInScope(host,p.scope))throw Error('Target is outside approved scope.');if(ui.phase===3&&!p.exploitApproved)throw Error('Save explicit exploitation approval before copying this proof command.');const f=foSelectedFinding(p);if(ui.phase===3&&(!f||f.status!=='validated'||f.host!==host))throw Error('Select a validated matching finding.');await copy(b.dataset.foCommand||'');}
+  else if(b.dataset.foReview){ui.editId=b.dataset.foReview;ui.modal='finding';render();}
+  else if(b.dataset.foExploit){ui.foFinding=b.dataset.foExploit;ui.phase=3;render();window.scrollTo(0,0)}
+  else if(b.dataset.foSummary){const field=document.querySelector('textarea[name="summary"]');if(field){field.value=b.dataset.foSummary;field.focus();field.scrollIntoView({behavior:'smooth',block:'center'});}}
+ }catch(err){fail(err)}
+},true);
+
+// Prevent lab proof records from being recorded as confirmed without a validated,
+// specifically linked in-scope finding and approval. Other outcomes remain documentable.
+document.addEventListener('submit',ev=>{
+ const form=ev.target;
+ if(!(form instanceof HTMLFormElement)||form.id!=='test-form')return;
+ const result=form.elements.namedItem('result')?.value;
+ if(result!=='Proof confirmed')return;
+ const p=current(),findingId=form.elements.namedItem('findingId')?.value;
+ const f=p?.findings.find(x=>x.id===findingId);
+ const host=form.elements.namedItem('host')?.value?.trim();
+ if(!p?.exploitApproved||!scopeSafety(p)||!f||f.status!=='validated'||f.host!==host||!isInScope(host,p.scope)){
+   ev.preventDefault();ev.stopImmediatePropagation();
+   fail(Error('Confirmed proof needs approval and a matching validated in-scope finding. Use Not attempted / Inconclusive when appropriate.'));
+ }
+},true);
+
+/* OAC FieldOps 3 — evidence-first, no repeated payload forms. Public GitHub Pages; no network calls. */
+'use strict';
+const OAC3_VERSION = '3.0';
+const OAC3_DEVICE_MENU = [
+  {name:'recon/Network_Hunter',role:'PRIMARY',description:'Initial discovery and service enumeration; inside this same payload is an optional Run All action.',recommended:true},
+  {name:'recon/advanced_nmap_scan',role:'FOLLOW-UP',description:'Run a targeted Nmap scan only when initial loot omits named hosts or open ports.'},
+  {name:'recon/SMB_Spy',role:'OPTIONAL',description:'SMB-specific assessment, only when SMB is discovered and this test is authorized.'},
+  {name:'util/simple_connection_test',role:'TROUBLESHOOTING',description:'Use if link, DHCP, default route, or connectivity fails.'},
+  {name:'util/advanced_ping_test',role:'TROUBLESHOOTING',description:'Confirm reachability to a known authorized IP; ping failure does not mean a host is offline.'},
+  {name:'recon/simple_client_info',role:'OPTIONAL',description:'Quick local addressing details on your device.'}
+];
+function oac3Init(p){foDefaults(p);if(!p.fieldops.v3)p.fieldops.v3={context:{},imports:[],deviceRuns:[],managementIp:p.fieldops.managementIp||'172.16.24.1'};return p.fieldops.v3}
+const oac3Setting = (label,value)=>`<div class="oac3-setting"><span>${e(label)}</span><b>${e(value)}</b></div>`;
+const oac3Key = (label,val)=>`<span class="oac3-tag"><b>${e(label)}</b> ${e(val)}</span>`;
+function oac3Upload(){return `<section class="panel oac3-upload"><div class="section-kicker">THE ONLY REQUIRED RESULT ENTRY</div><h2 class="panel-title">Drop your Shark Jack loot here. FieldOps does the sorting.</h2><p class="panel-desc">Select one or several files: <code>network_hunter_*.txt</code>, Nmap <code>.txt</code> / <code>.xml</code>, and other scan logs. No need to type payload names, IP addresses, ports or findings manually.</p><form id="import-form" class="oac3-drop"><label class="oac3-drop-label" for="oac3-files"><span class="oac3-drop-icon">⇧</span><b>Choose logs to analyze automatically</b><span>Multiple files supported · each up to 2 MB · never uploaded to a server</span></label><input id="oac3-files" type="file" name="files" multiple accept=".txt,.xml,.nmap,.gnmap,.log,.csv" required><button type="submit" class="btn primary">Analyze loot → Build assessment</button></form><p class="tiny">Nmap XML gives the best service/version details. FieldOps hashes each file, deduplicates repeat imports and stores only parsed observations and limited redacted excerpts inside your encrypted vault.</p></section>`}
+function oac3Scope(p){const valid=scopeSafety(p);if(valid)return `<details class="oac3-scoped"><summary>✓ Engagement scope saved once: <b>${e(p.scope)}</b> <span>${p.exploitApproved?"All-phase permission recorded · Edit scope ▾":"Open once to enable all six phases ▾"}</span></summary>${foOldRecon(p).split('<section class="panel"><div class="panel-header"><div><div class="section-kicker">KALI FIRST STEPS')[0]}</details>`;
+  const old=foOldRecon(p);const cut=old.indexOf('<section class="panel"><div class="panel-header"><div><div class="section-kicker">KALI FIRST STEPS');const scope=cut>=0?old.slice(0,cut):old;return `<div class="oac3-setup-note"><b>One-time setup</b><p>Enter the approved subnet and authorization once for this engagement. FieldOps will reuse it across all six phases—no repeated scope forms.</p></div>${scope}`}
+function oac3RunAllNotice(){return `<div class="callout warn"><b>About Network_Hunter → Run All:</b> On your payload, this branches into HTTP enumeration, SMB enumeration, SSH reconnaissance, and FTP credential spraying. The last action can attempt logins and trigger lockouts. <b>Begin with the initial discovery scan.</b> Use Run All only when your scope specifically permits authentication testing and the target owner accepts that risk. If authentication testing is explicitly permitted, select Run All after the initial scan; it is a submenu action inside Network_Hunter, not a separate payload you need to log. FieldOps will analyze supported output from either path.</div>`}
+function oac3Recon(p){const m=oac3Init(p),summary=oac3Summary(p);return `<div class="oac3-flowline">${oac3Key('NOW','Run Network_Hunter')}${oac3Key('THEN','Copy saved loot')}${oac3Key('FINALLY','Upload results')}</div>${oac3Scope(p)}${foPanel('Your Shark Jack: exact starting procedure','There is no need to record a payload run. Just follow these instructions and upload the result.',`
+ <div class="oac3-primary"><span class="oac3-pill">START HERE · BUILT-IN PAYLOAD</span><h2>recon / Network_Hunter</h2><div class="oac3-path">Shark Jack Display → Payload Library → recon → <b>Network_Hunter</b></div></div>
+ ${foStep('Plug into your authorized network',`Select <code>DHCP_CLIENT</code> if this payload asks for network mode on a LAN that already uses DHCP. Do not use DHCP_SERVER on an existing managed network.`,1)}
+ ${foStep('Run its initial network scan',`Select the <b>initial discovery / network scan</b> option inside <code>Network_Hunter</code> first. This is the step intended to report live hosts and discovered services. You do not need to know the loot filename yet.`,2)}
+ <div class="oac3-settings">${oac3Setting('Host timeout, if asked','Start with 100 seconds per host')}${oac3Setting('Max retries, if asked','2')}${oac3Setting('Scan type, if asked','Discovery / services (not -sL list-only)')}${oac3Setting('Target range','Only the CIDR saved above: '+(scopeSafety(p)?p.scope:'your authorized range'))}</div>
+ <p class="tiny">These are suggested operator settings, not guaranteed menu fields or factory defaults. Only enter settings that your installed payload actually presents. Previously, a 30-second host timeout missed ports in this environment; 100 seconds is a more patient starting point.</p>
+ ${foStep('Wait for completion; do not type the output into FieldOps',`Keep the Shark Jack loot on the device. Go to <b>Phase 02: Enumeration</b> to copy its files via SSH/SCP, or simply import them here once transferred.`,3)}
+ ${oac3RunAllNotice()}
+ <details class="oac3-details"><summary>Other names actually present in your Shark Jack menu (only when needed) ▾</summary><div class="oac3-menu">${OAC3_DEVICE_MENU.filter(x=>!x.recommended).map(x=>`<div><strong>${e(x.name)}</strong><span>${e(x.description)}</span></div>`).join('')}</div><p class="tiny">Your factory menu also has example/demo, LLDP, and utility payloads; this assessment does not require running them all.</p></details>
+ <div class="actions-row"><button class="btn primary" data-phase="1">Show me the exact SSH/SCP transfer commands →</button></div>`,'SHARK JACK DISPLAY')}${oac3Upload()}${oac3ImportHighlights(p,summary)}<div class="oac3-after">${p.sources.length?'Your files have been analyzed. Open Enumeration to see exactly what FieldOps learned.':'No files imported yet. There is nothing you need to manually log here.'}</div>`;
+}
+function oac3Summary(p){const m=oac3Init(p),ctx=m.context;return {count:p.assets.filter(a=>isInScope(a.host,p.scope)).length,ports:p.assets.filter(a=>isInScope(a.host,p.scope)).reduce((n,a)=>n+a.ports.length,0),reported:ctx.liveHosts||null,files:p.sources.length,findings:p.findings.length};}
+function oac3ImportHighlights(p,summary=oac3Summary(p)){const m=oac3Init(p),c=m.context;return foPanel('Automatic results: what we know so far','Everything below is derived from imported evidence, not entered by hand.',`<div class="oac3-statgrid"><div><b>${summary.files}</b><span>files processed</span></div><div><b>${summary.count}</b><span>identified in-scope IPs</span></div><div><b>${summary.ports}</b><span>observed open ports</span></div><div><b>${summary.reported??'—'}</b><span>Hunter live-host count</span></div></div>${c.network?`<div class="oac3-tags">${oac3Key('Observed subnet',c.network)}${oac3Key('Shark Jack IP',c.deviceIp||'not reported')}${oac3Key('Gateway',c.gateway||'not reported')}${oac3Key('DNS',c.dns||'not reported')}</div>`:''}${summary.reported>0&&summary.count===0?foStatus(`<b>Important:</b> Network Hunter reported ${summary.reported} live host(s), but your uploaded summary did not include their individual IPs. FieldOps cannot invent them. Phase 02 provides an exact in-scope Kali discovery command to fill this gap.`,'warn'):''}${c.spray?`<div class="oac3-spray"><b>Run All / All Spray observations</b><p>These are log observations, not evidence of successful access:</p>${Object.entries(c.spray).map(([svc,result])=>oac3Key(svc.toUpperCase(),result)).join('')}</div>`:''}${p.sources.length?`<div class="item-list">${p.sources.slice(0,6).map(s=>`<div class="item"><b>${e(s.name)}</b><div class="small">${e(s.count)} new ports · ${e(s.oac3Type||'Scan evidence')} · SHA-256 ${e(s.sha.slice(0,16))}…</div></div>`).join('')}</div>`:''}`,'PARSED EVIDENCE')}
+function oac3Transfer(p){const m=oac3Init(p),ip=m.managementIp||p.fieldops.managementIp||'172.16.24.1';const os=ui.oac3OS||'kali';const linux=[
+ ['01 Verify you are on your local terminal','ip -br addr','Run on Kali laptop. Confirm a local interface can access Shark Jack management.'],
+ ['02 Confirm SSH is reachable',`ssh root@${ip}`,'This opens the remote shell; verify the host fingerprint.'],
+ ['03 Inspect saved loot (inside SSH)','find /root/loot -type f -print','Use this at the root@shark prompt to discover real filenames.'],
+ ['04 Exit Shark Jack shell','exit','Return to your Kali shell before using scp.'],
+ ['05 Create a local collection folder','mkdir -p "$HOME/FieldOps-Loot"','This directory is on Kali, not the Shark Jack.'],
+ ['06 Download ONLY Shark Jack loot',`scp -r root@${ip}:/root/loot "$HOME/FieldOps-Loot/"`,'Copies scan output to Kali; does not retrieve workstation files.'],
+ ['07 Find your files','find "$HOME/FieldOps-Loot" -type f -print','Now select these files above for automatic parsing.']
+ ];const windows=[
+ ['01 Test SSH from PowerShell',`Test-NetConnection ${ip} -Port 22`,'Checks whether Shark Jack SSH is reachable.'],
+ ['02 Enter the Shark Jack shell',`ssh root@${ip}`,'Confirm the device fingerprint when connecting.'],
+ ['03 List saved loot (inside SSH)','find /root/loot -type f -print','Use inside root@shark prompt.'],
+ ['04 Exit the remote shell','exit','SCP must be run locally.'],
+ ['05 Create destination directory','New-Item -ItemType Directory -Force -Path "$HOME\\Documents\\FieldOps-Loot"','Runs in your local PowerShell.'],
+ ['06 Copy Shark Jack loot',`scp -r root@${ip}:/root/loot "$HOME\\Documents\\FieldOps-Loot\\"`,'Copies saved Shark Jack evidence to your Documents folder.'],
+ ['07 Display copied files','Get-ChildItem "$HOME\\Documents\\FieldOps-Loot" -File -Recurse | Select-Object FullName,Length','Find the files to upload into the app.']
+ ];return foPanel('Copy Shark Jack loot to your laptop','Exact commands for Kali or Windows; copy one step at a time. No payload log entries required.',`
+ <div class="oac3-transfer-top"><label class="field"><span>Computer used for retrieval</span><select id="oac3-os"><option value="kali" ${os==='kali'?'selected':''}>Kali / Linux</option><option value="windows" ${os==='windows'?'selected':''}>Windows PowerShell</option></select></label><form data-oac3="mgmt" class="field"><label>Verified Shark Jack management IP</label><div class="oac3-mgmt"><input type="text" name="ip" value="${e(ip)}" required><button class="btn small-btn" type="submit">Use IP</button></div></form></div>
+ ${foStatus('Use the IP actually shown by your Shark Jack management interface. <code>172.16.24.1</code> is a common reference value, not a promise that your device is currently configured with it.')}
+ ${(os==='windows'?windows:linux).map(([label,cmd,why])=>foCommand(label,cmd,why,null,p)).join('')}
+ ${foStatus('If the directory is empty, the payload may not have written output. Check the selected payload and its actual save path. Do not assume every completed payload produced loot.','warn')}`,'SSH / SCP TRANSFER')}
+function oac3DiscoveryCommand(p){return scopeSafety(p)?`sudo nmap -sn -n --max-retries 2 --host-timeout 100s -oX "$HOME/FieldOps-Loot/host-discovery.xml" ${p.scope}`:'Save your approved scope first';}
+function oac3ScanCandidates(p){return p.assets.filter(a=>isInScope(a.host,p.scope)).map(a=>{
+ const ports=(a.ports||[]).map(x=>+x.port).filter(Number.isInteger);return {host:a.host,ports:ports.length? [...new Set(ports)].sort((x,y)=>x-y):[],name:a.hostname||''};
+});}
+function oac3MissingCard(p,h){const cmd=`sudo nmap -Pn -n -sT -sV --version-light --top-ports 100 --max-retries 2 --host-timeout 100s -oX "$HOME/FieldOps-Loot/service-${h.host}.xml" ${h.host}`;
+return `<div class="oac3-next"><b>${e(h.host)} ${e(h.name)}</b><p>IP found but no listening TCP services are recorded yet. Run a small targeted service scan.</p>${foCommand('Kali → check common ports',cmd,'Top 100 TCP ports; outputs XML for automatic import.',h.host,p)}</div>`;}
+function oac3KnownCard(p,h){const cmd=`sudo nmap -Pn -n -sV --version-light -p ${h.ports.join(',')} -oX "$HOME/FieldOps-Loot/versions-${h.host}.xml" ${h.host}`;
+return `<div class="oac3-next"><b>${e(h.host)}</b><span class="oac3-mini">Open port(s): ${e(h.ports.join(', '))}</span><p>These ports were observed in your imported evidence. Collect missing version details when necessary.</p>${foCommand('Kali → fingerprint observed ports',cmd,'Confirm services; reimport XML to merge results.',h.host,p)}</div>`;}
+function oac3Enumerate(p){const summary=oac3Summary(p),hosts=oac3ScanCandidates(p),bare=hosts.filter(h=>!h.ports.length),known=hosts.filter(h=>h.ports.length);let next='';
+if(summary.reported>0&&!hosts.length)next+=`<div class="oac3-next"><b>Network Hunter reported ${summary.reported} hosts but did not give their IPs.</b><p>Run this one approved in-scope Kali discovery and reimport its XML. FieldOps will identify IP addresses without inventing them.</p>${foCommand('Kali → identify live IPs',oac3DiscoveryCommand(p),'Read-only host discovery; no password attempts.',null,p)}</div>`;
+if(bare.length)next+='<h3>Known IPs · missing port inventory</h3>'+bare.map(h=>oac3MissingCard(p,h)).join('');
+if(known.length)next+='<h3>Known open services · version check if needed</h3>'+known.map(h=>oac3KnownCard(p,h)).join('');
+if(!p.sources.length)next+='<div class="empty">No loot imported. Run Network_Hunter in Phase 01, then bring over its output.</div>';
+if(p.sources.length&&!hosts.length&&!summary.reported)next+=foStatus('This file contained no parseable host or service entries. Try an Nmap XML result; FieldOps will not fabricate assets.','warn');
+next+='<div class="actions-row"><button class="btn primary" data-phase="2">Next → Targeted vulnerability checks</button></div>';
+return `<div class="oac3-flowline">${oac3Key('01','Copy loot')}${oac3Key('02','Drop logs')}${oac3Key('03','Run only missing-data checks')}</div>`+
+ `<details class="oac3-transfer-details" ${p.sources.length?'':'open'}><summary>Need to copy Shark Jack loot with SSH / SCP? Open exact steps ▾</summary>${oac3Transfer(p)}</details>`+oac3Upload()+oac3ImportHighlights(p,summary)+
+ foPanel('What is missing? FieldOps chooses the next check','No repeated setup. Recommendations update automatically after every import.',next,'NEXT ACTION ENGINE')+
+ foPanel('Asset inventory — imported, not typed','Automatically merged by host and open port.',assetsTable(p),'AUTOMATED INVENTORY');}
+function oac3AllChecks(p){const checks=foAllChecks(p);const known=new Set(checks.map(x=>`${x.host}/${x.port}`));
+ for(const a of p.assets.filter(a=>isInScope(a.host,p.scope))){for(const service of a.ports||[]){const port=Number(service.port);if(!Number.isInteger(port)||port<1||port>65535||known.has(`${a.host}/${port}`))continue;
+ const protocol=service.protocol==='udp'?'udp':'tcp';checks.push({host:a.host,port,service:service.service||'unknown',version:service.version||'',key:'generic-'+protocol,name:'Unknown / other '+protocol.toUpperCase()+' service',tool:'Nmap version detection',why:'No specialized rule matches this port. Identify the actual application and version before checking vendor advisories.',expect:'A service/version result is a starting lead, not a confirmed security flaw.',cmd:(h,n)=>protocol==='udp'?`sudo nmap -sU -Pn -n -sV --version-light -p ${n} --max-retries 2 -oX "oac-${h}-${n}-udp.xml" ${h}`:`sudo nmap -Pn -n -sV --version-all -p ${n} -oX "oac-${h}-${n}-service.xml" ${h}`});known.add(`${a.host}/${port}`)}}return checks;}
+function oac3Vuln(p){const summary=oac3Summary(p),checks=oac3AllChecks(p);return `${oac3ImportHighlights(p,summary)}${foPanel('Kali vulnerability investigation from actual ports','FieldOps builds a queue ONLY from observed in-scope services. No open port is itself proof of a vulnerability.',`${!checks.length?foStatus('No service-specific tasks yet. Go to Enumeration and import a scan with individual host IPs and open ports. A Network Hunter summary saying “3 hosts” cannot identify vulnerabilities by itself.','warn'):`<div class="oac3-checks">${checks.map(c=>{const evidence=p.evidenceChecks.filter(x=>x.host===c.host&&x.port===c.port&&(x.checkKey===c.key||x.checkKey===c.result));const finding=p.findings.find(x=>x.host===c.host&&x.autoPort===c.port&&x.autoKind);return `<div class="oac3-check"><div class="oac3-check-heading"><b>${e(c.host)}:${e(c.port)} — ${e(c.name)}</b><span>${e(c.tool)}</span></div><p>${e(c.why)}</p>${foCommand('Run in Kali, then import the XML below',c.cmd(c.host,c.port),c.expect,c.host,p)}<p class="tiny">${e(c.expect)}</p><div class="oac3-mini">${e(evidence.length?evidence.length+' linked script observation(s)':'Awaiting matching import')}${finding?' · Candidate finding: '+e(finding.status):''}</div></div>`}).join('')}</div>`}`,'AUTOMATED INVESTIGATION QUEUE')}${oac3Upload()}${foPanel('Candidate findings carried into Phase 04','A script can create a suspected finding. Only actual confirmation can upgrade it to validated.',`${p.findings.map(f=>`<div class="fo-finding"><div class="fo-finding-title"><b>${e(f.title)}</b> <span class="tag ${f.status==='validated'?'green':'yellow'}">${e(f.status)}</span></div><div class="tiny">${e(f.host)}:${e(f.autoPort||'')} · ${e(f.sourceLabel||'source recorded')}</div><div class="fo-evidence">${e(f.evidence||'Evidence not supplied')}</div><button class="btn small-btn" type="button" data-fo-review="${e(f.id)}">Review / validate finding</button></div>`).join('')||'<div class="empty">No suspected vulnerabilities observed from the imported evidence yet. That does not establish that the network is vulnerability-free.</div>'}<div class="actions-row"><button class="btn primary" data-phase="3">Continue → Controlled proof / exploitation</button></div>`,'EVIDENCE → FINDING')}`}
+function oac3Research(p){return `<div class="oac3-hint">From this point, approved proof, post-test cleanup and reporting are linked to the actual findings above. FieldOps will not label a vulnerability exploited just because a scanner identified a service.</div>`;}
+const oac3PreviousImport=importFiles;
+// Preserve the original vetted Nmap/NSE parsers, supplementing the text summary parser with source metadata.
+function oac3ReadHunter(text){const lines=String(text||'').replace(/\r/g,'');const value=(pattern)=>lines.match(pattern)?.[1]?.trim()||'';let summary={};if(/===\s*Network Hunter/i.test(lines)||/Live hosts discovered:\s*\d+/i.test(lines)){
+ summary.type='Network_Hunter';summary.liveHosts=Number(value(/Live hosts discovered:\s*(\d+)/i))||0;summary.deviceIp=value(/(?:^|\n)My IP:\s*([^\n]+)/i);summary.gateway=value(/(?:^|\n)Gateway:\s*([^\n]+)/i);summary.dns=value(/(?:^|\n)DNS:\s*([^\n]+)/i);summary.network=value(/(?:^|\n)Network:\s*([^\n]+)/i);}
+ else if(/===\s*All Credential Spray/i.test(lines)||/FTP Targets:\s*/i.test(lines)&&/SMB Targets:\s*/i.test(lines)){
+ summary.type='All_Spray';summary.spray={ftp:value(/FTP Targets:\s*([^\n]+)/i),ssh:value(/SSH Targets:\s*([^\n]+)/i),smb:value(/SMB Targets:\s*([^\n]+)/i)};}
+ else if(/<nmaprun\b|Nmap scan report for|^Host:\s*\d{1,3}\./mi.test(lines))summary.type='Nmap output';else summary.type='Other scan/loot';return summary;}
+const oac3PreviousParseScan=parseScan;
+parseScan=function(text,filename){if(/(?:\bnmap[^\r\n]*\s-sL(?=\s|$)|<scaninfo\b[^>]*\btype="list")/i.test(text))return [];
+ const records=oac3PreviousParseScan(text,filename),known=new Set(records.map(x=>x.host));
+ // Network Hunter uses several optional host-list styles across versions. Accept only unambiguous IP rows.
+ const extra=[];for(const line of String(text).split(/\r?\n/)){
+  let m=line.match(/^\s*(?:Host|IP|Target|Live host)\s*[:=]\s*((?:\d{1,3}\.){3}\d{1,3})(?:\s|$)/i);
+  if(!m)m=line.match(/^\s*((?:\d{1,3}\.){3}\d{1,3})\s+(?:alive|online|up|reachable)\b/i);
+  if(m&&validIPv4(m[1])&&!known.has(m[1])){extra.push({host:m[1],hostname:'',ports:[]});known.add(m[1]);}
+  const combo=line.match(/^\s*((?:\d{1,3}\.){3}\d{1,3}):([0-9]{1,5})\s+([A-Za-z][\w.-]*)\s*(?:open|OPEN)?/);
+  if(combo&&validIPv4(combo[1])){const target=records.concat(extra).find(x=>x.host===combo[1]);if(target){target.ports.push({port:Number(combo[2]),protocol:'tcp',service:combo[3],state:'open',source:filename})}else{extra.push({host:combo[1],hostname:'',ports:[{port:Number(combo[2]),protocol:'tcp',service:combo[3],state:'open',source:filename}]});known.add(combo[1]);}}
+ }
+ return records.concat(extra);
+};
+importFiles=async function(p,files){oac3Init(p);const before=new Set(p.sources.map(x=>x.sha));const metadata=[];
+ for(const file of files){if(file.size>2*1024*1024)throw Error(file.name+' exceeds the 2 MB parser limit.');const buf=await file.arrayBuffer();const hash=[...new Uint8Array(await crypto.subtle.digest('SHA-256',buf))].map(x=>x.toString(16).padStart(2,'0')).join('');if(before.has(hash))continue;metadata.push({name:file.name,sha:hash,info:oac3ReadHunter(dec.decode(buf))});}
+ await oac3PreviousImport(p,files);
+ const m=oac3Init(p);for(const item of metadata){const source=p.sources.find(s=>s.sha===item.sha);if(!source)continue;source.oac3Type=item.info.type;if(m.imports.some(x=>x.sha===item.sha))continue;m.imports.unshift({at:time(),sha:item.sha,name:item.name,type:item.info.type});if(item.info.type==='Network_Hunter'){
+  for(const key of ['liveHosts','deviceIp','gateway','dns','network'])if(item.info[key]!==undefined&&item.info[key]!==''&&item.info[key]!==null)m.context[key]=item.info[key];
+ }
+ if(item.info.type==='All_Spray')m.context.spray=item.info.spray;
+ }
+ m.imports=m.imports.slice(0,100);if(ui.phase===0&&metadata.length)ui.phase=1;
+ log(p,'Automatically classified '+metadata.length+' new loot file(s) and refreshed discovery context');await persist();render();message('Loot analyzed — '+p.assets.length+' unique IP(s), '+allPorts(p)+' open service(s), '+p.findings.length+' finding candidate(s).');
+};
+// Replace v2 collection of forms with one-pass guides. Keep existing secure vault, approved scope, and linked proof/report system.
+recon=oac3Recon;enumeration=oac3Enumerate;vulnerability=oac3Vuln;
+const oac3OldExploit=exploitation;exploitation=function(p){return oac3Research(p)+oac3OldExploit(p)};
+// Scope form and upload are handled by app.js. Our two controls are handled at the capture phase.
+document.addEventListener('submit',async ev=>{const form=ev.target;if(!(form instanceof HTMLFormElement)||form.dataset.oac3!=='mgmt')return;ev.preventDefault();ev.stopImmediatePropagation();try{const p=current();if(!p)return;const ip=String(new FormData(form).get('ip')||'').trim();if(!validIPv4(ip))throw Error('Enter a valid Shark Jack management IPv4 address');oac3Init(p).managementIp=ip;p.fieldops.managementIp=ip;await commit('Updated Shark Jack SSH address');}catch(err){fail(err)}},true);
+document.addEventListener('change',ev=>{if(ev.target?.id==='oac3-os'){ev.stopImmediatePropagation();ui.oac3OS=ev.target.value;render()}},true);
+// Compact, evidence-derived stage progress: no redundant 24-checkbox data-entry exercise.
+function oac3StageItems(p){const hunter=p.sources.some(s=>s.oac3Type==='Network_Hunter');const scripted=(p.evidenceChecks||[]).length;
+ const inScope=p.assets.filter(a=>isInScope(a.host,p.scope));const open=inScope.reduce((n,a)=>n+a.ports.length,0);
+ const validated=p.findings.filter(f=>f.status==='validated').length;
+ const logged=p.tests.length;
+ const completedCleanup=logged&&p.tests.every(t=>String(t.cleanup||'').trim().length>0);
+ return [
+  [['Approved scope saved',scopeSafety(p)],['Network Hunter result imported',hunter],['Loot transferred and analyzed',p.sources.length>0]],
+  [['Individual host IPs identified',inScope.length>0],['Open ports and services identified',open>0],['Service fingerprints imported',inScope.some(a=>a.ports.some(s=>!!s.version))]],
+  [['Service-specific investigations generated',oac3AllChecks(p).length>0],['Targeted scanner output imported',scripted>0],['Potential findings reviewed',p.findings.length>0]],
+  [['Finding validated for a proof plan',validated>0],['Explicit exploitation approval saved',p.exploitApproved],['Controlled test outcome recorded',logged>0]],
+  [['Test impact documented',logged>0||!!p.postNotes],['Cleanup documented',!!completedCleanup],['Post-test limitations recorded',!!p.postNotes]],
+  [['Report has inventory and evidence',p.sources.length>0],['Summary written',!!p.summary],['Remediation narrative reviewed',!!p.recommendations]]
+ ][ui.phase]||[];
+}
+checklist=function(p){const items=oac3StageItems(p),yes=items.filter(x=>x[1]).length;return `<section class="panel oac3-progress"><div class="panel-header"><div><div class="section-kicker">AUTOMATIC PROGRESS</div><h2 class="panel-title">What FieldOps can already prove</h2><p class="panel-desc">These indicators are derived from saved logs and records. You don't have to tick boxes manually.</p></div><span class="tag muted">${yes}/${items.length}</span></div><div class="oac3-progress-list">${items.map(([label,on])=>`<div><span class="${on?'oac3-yes':'oac3-no'}">${on?'✓':'○'}</span> ${e(label)}</div>`).join('')}</div><p class="tiny">Incomplete indicators mean the information is not recorded; they are not a verdict that the target is vulnerable or secure.</p></section>`;}
+stepAdvice=function(p){const summary=oac3Summary(p),phase=ui.phase;const suggestions=[
+ 'Run recon/Network_Hunter initial network scan; then import saved loot. No payload data entry needed.',
+ summary.count===0&&summary.reported>0?'Network Hunter reported hosts but did not list IPs. Run the generated Kali host-discovery command.':summary.ports===0?'Find the named IPs and run the generated service check.':'Individual hosts and ports are identified. Continue to the targeted Kali checks.',
+ 'Run only the generated commands for observed services; reimport their XML outputs for correlated findings.',
+ 'Choose an evidence-backed, validated finding. If explicitly approved, perform minimal proof and record the observed result.',
+ 'Review demonstrated access, cleanup and limitations. Do not collect unrelated data.',
+ 'Review the auto-populated inventory and findings, complete the report narrative, and export.'
+ ];return `<div class="panel tight"><div class="section-kicker">NEXT BEST ACTION</div><h3 class="subheading" style="margin:8px 0">${e(suggestions[phase])}</h3><p class="small">${phase===0?'Start with Network_Hunter — Run All is optional and contains credential checks.':'Each imported scan updates the relevant later phases automatically.'}</p>${phase<5?`<button type="button" class="btn small-btn primary" data-phase="${phase+1}">Go to next phase →</button>`:''}</div>`;}
+const oac3OldShell=shell;shell=function(p){const html=oac3OldShell(p);return html.replace('OAC FIELDOPS / v1.0','OAC FIELDOPS / v3.0');};
+
+/* OAC FieldOps 4: One evidence inbox, evidence-faithful classification and targeted guided payloads.
+   Everything stays inside the encrypted v1 vault, no network requests or remote execution. */
+'use strict';
+const OAC4_VERSION='4.0';
+const OAC4_EXT=/\.(txt|xml|nmap|gnmap|log|csv)$/i;
+const oac4Queue=new Map();
+let oac4Importing=false;
+function oac4Init(p){oac3Init(p);if(!p.fieldops.v4)p.fieldops.v4={observations:[],hostEvidence:[],analysis:[]};return p.fieldops.v4;}
+function oac4Evidence(text,name){
+ const result={type:'other',ports:[],hosts:[],hostRows:[],listOnly:false,warnings:[],reported:null,source:name};
+ const t=String(text||'');
+ if(/===\s*Network Hunter/i.test(t)){
+  result.type='Network Hunter';const match=t.match(/Live hosts discovered:\s*(\d+)/i);if(match)result.reported=Number(match[1]);
+  if(/ENUMERATED HOSTS & SERVICES\s*\n[=\-]+\s*\n\s*\n\s*Scan complete/i.test(t))result.warnings.push('Hunter reports a count but the enumerated hosts/services section is empty.');
+  return result;
+ }
+ if(/===\s*SMB Spy/i.test(t)){
+  result.type='SMB Spy';if(/No SMB hosts found/i.test(t))result.warnings.push('SMB Spy did not find an accessible SMB host; this does not prove that TCP/445 is closed on every device.');
+  return result;
+ }
+ if(/===\s*All Credential Spray/i.test(t)){
+  result.type='All Spray';result.warnings.push('Credential-spray module reported target selection only. No confirmed open service or successful authentication can be inferred.');
+  return result;
+ }
+ if(/(?:^|\n)\s*nmap\b[^\n]*\s-sL(?:\s|$)/i.test(t)||/<scaninfo\b[^>]*\btype=["']list["']/i.test(t)){
+  result.type='Nmap list-only (-sL)';result.listOnly=true;result.warnings.push('-sL only enumerates possible addresses and name lookups. Its scan report lines are NOT proof hosts are up.');
+  return result;
+ }
+ if(/<nmaprun(?:\s|>)/i.test(t)){
+  result.type='Nmap XML';
+  try{const doc=new DOMParser().parseFromString(t,'application/xml');if(doc.querySelector('parsererror'))throw Error('XML syntax');
+    for(const h of doc.querySelectorAll('nmaprun > host')){
+      const ip=[...h.querySelectorAll(':scope > address')].find(a=>a.getAttribute('addrtype')==='ipv4')?.getAttribute('addr');
+      if(!ip||!validIPv4(ip))continue;
+      const status=h.querySelector(':scope > status')?.getAttribute('state')||'unknown';
+      if(status==='up'){result.hosts.push(ip);result.hostRows.push({ip,state:'up'})}
+      for(const el of h.querySelectorAll(':scope > ports > port')){
+        const n=Number(el.getAttribute('portid')),protocol=el.getAttribute('protocol')||'tcp',state=el.querySelector(':scope > state')?.getAttribute('state')||'unknown';
+        if(n>0&&n<=65535)result.ports.push({host:ip,port:n,protocol,state,service:el.querySelector(':scope > service')?.getAttribute('name')||'unknown'});
+      }
+    }
+  }catch(err){result.warnings.push('Could not read Nmap XML states: '+err.message)}
+  return result;
+ }
+ if(/Nmap scan report for|^Host:\s+\d{1,3}\./mi.test(t)){
+  result.type='Nmap text';let host='',rows=[];
+  for(const line of t.split(/\r?\n/)){
+    const m=line.match(/^Nmap scan report for\s+(?:(?:.*?)\s+\(((?:\d{1,3}\.){3}\d{1,3})\)|((?:\d{1,3}\.){3}\d{1,3}))/i);
+    if(m){host=m[1]||m[2];if(!validIPv4(host))host='';continue;}
+    if(/^Host is up\b/i.test(line)&&host){result.hosts.push(host);result.hostRows.push({ip:host,state:'up'});}
+    const p=line.match(/^\s*(\d{1,5})\/(tcp|udp)\s+(open\|filtered|open|filtered|closed|closed\|filtered|unfiltered)\s+(\S+)/i);
+    if(p&&host){const port=Number(p[1]);if(port>=1&&port<=65535)result.ports.push({host,port,protocol:p[2].toLowerCase(),state:p[3].toLowerCase(),service:p[4]});}
+  }
+  result.hosts=[...new Set(result.hosts)];
+  return result;
+ }
+ if(/Live hosts on subnet:\s*\d+|No SMB hosts found/i.test(t))result.type='SMB discovery';
+ return result;
+}
+function oac4RegisterEvidence(p,files){const v=oac4Init(p);for(const file of files){const item=file.oac4; if(!item)continue;
+ const existing=p.sources.find(s=>s.sha===item.sha);if(!existing||v.analysis.some(x=>x.sha===item.sha))continue;
+ v.analysis.unshift({sha:item.sha,name:file.webkitRelativePath||file.name,type:item.ob.type,listOnly:item.ob.listOnly,reported:item.ob.reported,warnings:item.ob.warnings,at:time(),hosts:item.ob.hosts.length,ports:item.ob.ports.length});
+ for(const row of item.ob.ports){if(!isInScope(row.host,p.scope))continue; const key=[row.host,row.port,row.protocol,row.state,item.sha].join('|');
+ if(!v.observations.some(x=>x.key===key))v.observations.push({...row,key,sha:item.sha,source:file.name});}
+ for(const host of item.ob.hosts){if(!isInScope(host,p.scope))continue;const key=host+'|'+item.sha;if(!v.hostEvidence.some(x=>x.key===key))v.hostEvidence.push({key,host,sha:item.sha,source:file.name});}
+ }
+ v.analysis=v.analysis.slice(0,300);v.observations=v.observations.slice(-3000);v.hostEvidence=v.hostEvidence.slice(-2000);
+}
+const oac4PriorImport=importFiles;
+importFiles=async function(p,files){const fresh=[];const prior=new Set(p.sources.map(x=>x.sha));for(const f of files){if(f.size>2*1024*1024)throw Error(f.name+' is larger than the 2 MB per-file limit.');const buf=await f.arrayBuffer();const sha=[...new Uint8Array(await crypto.subtle.digest('SHA-256',buf))].map(b=>b.toString(16).padStart(2,'0')).join('');if(prior.has(sha))continue;prior.add(sha);f.oac4={sha,ob:oac4Evidence(dec.decode(buf),f.name)};fresh.push(f)}
+ if(!fresh.length){message('All selected files were already imported; no duplicates added.');return}
+ const phase=ui.phase;await oac4PriorImport(p,fresh);oac4RegisterEvidence(p,fresh);ui.phase=phase;await persist();render();message(`${fresh.length} files analyzed: ${p.assets.length} identified hosts, ${allPorts(p)} open ports, ${oac4Init(p).observations.filter(x=>x.state==='filtered').length} filtered-port observations.`);
+};
+function oac4Stats(p){const v=oac4Init(p);const scoped=p.assets.filter(a=>isInScope(a.host,p.scope));const counts={open:0,filtered:0,closed:0};for(const r of v.observations)if(r.state in counts)counts[r.state]++;
+ return {...counts,assets:scoped.length,openObserved:scoped.reduce((n,a)=>n+a.ports.length,0),reported:oac3Init(p).context.liveHosts||0};}
+function oac4Tip(messageText,kind='info'){return `<div class="callout ${kind}">${messageText}</div>`;}
+function oac4MiniStat(label,num){return `<div><b>${e(num)}</b><span>${e(label)}</span></div>`;}
+function oac4Command(name,cmd,explain,host,p){return `<div class="oac4-cmd"><b>${e(name)}</b><p>${e(explain)}</p>${foCommand('Run in your Kali terminal',cmd,explain,host,p)}</div>`;}
+function oac4Payload(id,name,when,details,params,after,recommend=true){return `<details class="oac4-payload" ${recommend?'open':''}><summary><span class="oac4-counter">${e(id)}</span><span><b>${e(name)}</b><small>${e(when)}</small></span><span class="oac4-chevron">▾</span></summary><div class="oac4-payload-body"><p>${e(details)}</p><div class="oac4-paramgrid">${params.map(([k,v])=>oac3Setting(k,v)).join('')}</div><p class="small"><strong>Output / next decision:</strong> ${e(after)}</p></div></details>`;}
+function oac4Checklist(p){const s=oac4Stats(p);const scope=scopeSafety(p);const active=p.assets.filter(a=>isInScope(a.host,p.scope));const smb=active.filter(a=>a.ports.some(z=>z.port===445));const http=active.filter(a=>a.ports.some(z=>[80,443,8080,8443].includes(z.port)));const ssh=active.filter(a=>a.ports.some(z=>z.port===22));const gw=oac3Init(p).context.gateway||'Your authorized gateway';const namedHosts=active.map(a=>a.host);const target=namedHosts.length?namedHosts[0]:'An IP confirmed by an actual discovery scan';
+ return foPanel('Shark Jack Display — run these payloads in a useful order','These are payloads previously identified in your workflow, not invented menu entries. Run the relevant built-ins; additional scans become useful as targets are identified.',`
+ ${oac4Payload('01','Simple Connection Test','Start here · basic connectivity','Check Ethernet link, DHCP lease, default gateway and DNS.',[['Network mode','DHCP_CLIENT on a LAN that already has DHCP'],['Target','Gateway / device connectivity'],['Timeout (if offered)','5 seconds per test; do not assume this is a firmware field']],'Proceed after network access is established.')}
+ ${oac4Payload('02','Advanced Ping Test','Recommended · verify a known host','Ping your verified gateway or another one approved target.',[['Host / target',gw],['Count (if offered)','4 echo requests'],['Timeout (if offered)','2 seconds per probe']],'Success means this specific address answered ICMP; failure does not prove it is offline.')}
+ ${oac4Payload('03','recon / Network_Hunter','Required baseline · initial discovery','Select the INITIAL network scan inside Network_Hunter before considering its Run All submenu.',[['Network mode','DHCP_CLIENT'],['Target network',scope?p.scope:'Save scope once above'],['Host timeout (if offered)','100 seconds'],['Max retries (if offered)','2']],'Save the hunter loot. If only a host count appears, use Advanced Nmap to obtain individual addresses and ports.')}
+ ${oac4Payload('04','recon / advanced_nmap_scan','Recommended · fill missing host/service details','Use an actual discovery or service scan; DO NOT choose -sL/list scan. -sL only enumerates possible addresses.',[['Target',s.reported&&!s.assets&&scope?p.scope:target],['Scan type','Host discovery (-sn) if IPs missing; TCP service enumeration (-sT/-sS) for known target'],['Host timeout (if offered)','100–120 seconds'],['Max retries (if offered)','2'],['Port selection (if offered)','Top 100 or targeted TCP ports; not -sL']],'Save Nmap text/XML. If Shark Jack does not produce complete output, use the equivalent Kali command in Phase 02.')}
+ ${oac4Payload('05','recon / SMB_Spy',smb.length?'Relevant · SMB open on '+smb.map(a=>a.host).join(', '):'Conditional · skip while SMB is only filtered/closed','Run only when an approved target has evidence of an accessible SMB listener; filtered is not open.',[['Target',smb.length?smb.map(a=>a.host).join(', '):'No confirmed SMB-open target yet'],['Timeout (if offered)','Conservative starting point: 10 seconds per target'],['Authentication','Do not attempt credentials during basic SMB discovery']],'Import SMB Spy output. No SMB hosts found is a scan observation, not proof all hosts are secure.',smb.length>0)}
+ ${oac4Payload('05B','recon / simple_client_info','Optional · quick IP context','Collect local Shark Jack addressing details when the initial payload did not record IP, mask, gateway or DNS.',[['Network mode','DHCP_CLIENT on existing LAN'],['Target','The local Shark Jack network adapter'],['Timeout','Use only fields that actually appear in your installed script']],'Import any saved result; otherwise refer to the display for device address. This is not a port scanner.',false)}
+ ${oac4Payload('06','Network_Hunter → service-specific submenu / Run All','Conditional · only after initial results','On your installed Network Hunter, Run All includes HTTP enumeration, SMB enumeration, SSH recon, and an FTP credential-spray component. Inspect/select the non-authentication modules individually if the device allows it. Do not use Run All as a default: the spray component can trigger account lockouts.',[['HTTP hosts',http.map(a=>a.host).join(', ')||'None discovered yet'],['SSH hosts',ssh.map(a=>a.host).join(', ')||'None discovered yet'],['FTP login attempts','Disabled / skip unless separately authorized']],'Import saved submodule logs. Credential spray is not required for network reconnaissance.',false)}
+ ${oac4Tip('<strong>Not every payload on the device belongs in an assessment.</strong> This guide uses built-ins substantiated by your prior workflow. Menu names and editable settings can vary by the installed script; unsupported fields are marked “if offered.” Do not run unrelated interception, packet capture, credential attack or disruptive payloads by default.','warn')}`,'SHARK JACK RUNBOOK')}
+function oac4TransferMini(p){const ip=oac3Init(p).managementIp||p.fieldops.managementIp||'172.16.24.1';const os=ui.oac4OS||'kali';const cmds=os==='windows'?[['1 · Inspect files on Shark Jack',`ssh root@${ip} "find /root/loot -type f -print"`,'Run from Windows PowerShell. Confirm the management IP first.'],['2 · Create an evidence folder','New-Item -ItemType Directory -Force -Path "$HOME\\Documents\\FieldOps-Loot"','Local folder on Windows.'],['3 · Copy the entire loot tree',`scp -r root@${ip}:/root/loot "$HOME\\Documents\\FieldOps-Loot"`,'Run SCP from LOCAL PowerShell, not the Shark Jack SSH shell.'],['4 · Verify transfer','Get-ChildItem -Recurse "$HOME\\Documents\\FieldOps-Loot" -File | Select-Object FullName','These are the folders and files available to upload below.']]:[['1 · Inspect files on Shark Jack',`ssh root@${ip} 'find /root/loot -type f -print'`,'One command from your Kali terminal; asks for SSH login as needed.'],['2 · Create your local evidence folder','mkdir -p "$HOME/Documents/FieldOps-Loot"','Stores files on your laptop.'],['3 · Copy the entire loot tree',`scp -r root@${ip}:/root/loot "$HOME/Documents/FieldOps-Loot/"`,'Run from the Kali terminal, not from an active root@shark prompt.'],['4 · Verify transfer','find "$HOME/Documents/FieldOps-Loot" -type f -print','Import the resulting folder using the folder picker or by dragging the directory.']];
+ return foPanel('After running the payloads: copy ALL loot to your laptop','Everything needed to transfer is here before the import box. The Shark Jack must be in the appropriate SSH/management mode.',`<div class="oac4-transferbar"><label>My computer<select id="oac4-os"><option value="kali" ${os==='kali'?'selected':''}>Kali Linux</option><option value="windows" ${os==='windows'?'selected':''}>Windows PowerShell</option></select></label><form data-oac3="mgmt"><label>Shark Jack management IPv4 (check device)</label><input name="ip" value="${e(ip)}" required><button class="btn small-btn" type="submit">Use this IP</button></form></div>${oac4Tip('Use the verified management interface address; <code>172.16.24.1</code> is a common example, not guaranteed on your Display model. SSH accesses Shark Jack loot—not workstation files.')}<div class="oac4-cmdlist">${cmds.map(([title,cmd,why])=>oac4Command(title,cmd,why,null,p)).join('')}</div>`,'TRANSFER / SSH / SCP')}
+function oac4Upload(){return `<section class="panel oac4-upload" id="oac4-evidence-inbox"><div class="section-kicker">ONE EVIDENCE INBOX · PHASE 01</div><h2 class="panel-title">Import once. Add files from as many folders as you need.</h2><p class="panel-desc">The app analyzes your files locally, connects host/port observations, and carries them into all six phases. Later scans go into this <em>same inbox</em>—not another form.</p><div id="oac4-drop" class="oac4-drop" tabindex="0" role="group" aria-label="Drop scan files and folders"><div class="oac4-arrow">⇧</div><b>Drag files or entire folders here</b><p>Or choose files, then choose another folder, then another. The collection will accumulate until you analyze it.</p><div class="oac4-pickers"><label class="btn small-btn" for="oac4-file-input">+ Add files</label><label class="btn small-btn" for="oac4-folder-input">+ Add folder</label></div><input id="oac4-file-input" type="file" multiple accept=".txt,.xml,.nmap,.gnmap,.log,.csv" hidden><input id="oac4-folder-input" type="file" webkitdirectory directory multiple hidden></div><div id="oac4-queued" aria-live="polite" class="oac4-queued"></div><div class="actions-row"><button id="oac4-import" class="btn primary" type="button">Analyze queued loot → update all phases</button><button type="button" class="btn small-btn" id="oac4-clear">Clear selection</button></div><p class="tiny">Supported text / Nmap XML, up to 2 MB per file and 40 MB per selection. Repeated files are deduplicated by SHA-256. No raw files are sent to a server. This is a browser-side importer, not direct device control.</p></section>`;}
+function oac4EvidenceCard(p){const v=oac4Init(p),s=oac4Stats(p),ctx=oac3Init(p).context;return foPanel('Your imported evidence — automatically interpreted','These numbers are drawn from observations, not forms or assumed vulnerabilities.',`<div class="oac3-statgrid">${oac4MiniStat('Identified live / scan-supported IPs',s.assets)}${oac4MiniStat('Confirmed open ports',s.openObserved)}${oac4MiniStat('Filtered observations',s.filtered)}${oac4MiniStat('Hunter reported hosts',s.reported||'—')}</div>${ctx.network?`<div class="oac3-tags">${oac3Key('Subnet',ctx.network)}${oac3Key('Shark Jack',ctx.deviceIp||'—')}${oac3Key('Gateway',ctx.gateway||'—')}</div>`:''}${v.analysis.some(x=>x.listOnly)?oac4Tip('A <b>-sL list-only scan</b> was imported. Its many “Nmap scan report for” lines are possible addresses, NOT confirmed live hosts. Run actual host discovery.','warn'):''}${v.analysis.filter(x=>x.warnings.length).slice(0,6).map(x=>oac4Tip(`<b>${e(x.name)}</b>: ${x.warnings.map(w=>e(w)).join(' ')}`,'warn')).join('')}<div class="oac4-evidence-table"><table><thead><tr><th>Host</th><th>Port</th><th>Observed state</th><th>Service hint</th><th>Evidence</th></tr></thead><tbody>${v.observations.slice(-40).reverse().map(r=>`<tr><td>${e(r.host)}</td><td>${e(r.port+'/'+r.protocol)}</td><td><span class="oac4-state ${e(r.state)}">${e(r.state)}</span></td><td>${e(r.service)}</td><td>${e(r.source)}</td></tr>`).join('')||'<tr><td colspan="5">No stateful ports observed yet. A summary-only scan does not establish that ports are closed.</td></tr>'}</tbody></table></div><p class="tiny">Open = service responds; filtered = firewall or network prevents deciding; closed = reachable endpoint rejects connection. These may differ by scanner location/time. ${e(v.analysis.length)} files classified.</p>`,'EVIDENCE INTERPRETATION');}
+function oac4NextSteps(p){const s=oac4Stats(p),scoped=p.assets.filter(a=>isInScope(a.host,p.scope)),ctx=oac3Init(p).context,scope=scopeSafety(p);let content='';
+ if(!scope)return oac4Tip('First save your approved scope once in Recon; commands are disabled without it.','warn');
+ if(!s.assets){content+=`<p>Network Hunter reported ${e(s.reported||'no confirmed count')} hosts, but no individual live IPs were established. Use <b>host discovery</b>, not list-only mode.</p>${oac4Command('Find actual responding hosts',`sudo nmap -sn -n --max-retries 2 --host-timeout 100s -oX "$HOME/Documents/FieldOps-Loot/discovery.xml" ${p.scope}`,'-sn sends discovery probes. -sL does NOT probe hosts.',null,p)}`;}
+ else {const noPorts=scoped.filter(a=>!a.ports.length);if(noPorts.length){content+=`<p>These hosts answered a scan but have <b>zero confirmed open ports</b> in the imported data. Pick a known authorized host for a targeted TCP service scan.</p>`;
+ content+=noPorts.slice(0,5).map(a=>oac4Command('Enumerate observed host '+a.host,`sudo nmap -Pn -n -sT -sV --version-light --top-ports 100 --max-retries 2 --host-timeout 120s -oX "$HOME/Documents/FieldOps-Loot/services-${a.host}.xml" ${a.host}`,'-Pn skips ping discovery for this ALREADY observed host; XML preserves port states.',a.host,p)).join('');
+ content+=noPorts.slice(0,2).map(a=>`<details class="oac4-payload"><summary><b>Still no open ports on ${e(a.host)}? Optional full TCP scan ▾</b></summary><div class="oac4-payload-body">${oac4Command('One owned host · all TCP ports',`sudo nmap -Pn -n -sT -p- --max-retries 2 --host-timeout 240s -oX "$HOME/Documents/FieldOps-Loot/fulltcp-${a.host}.xml" ${a.host}`,'More thorough and slower. Only run on a specifically authorized host. A timeout can leave incomplete coverage.',a.host,p)}</div></details>`).join('');}
+ if(s.openObserved){content+=`<p>Confirmed open ports already exist. Phase 03 will generate service-specific checks only for those ports.</p><button class="btn small-btn primary" data-phase="2">View service-specific investigation →</button>`;}
+ }
+ const filteredOnly=oac4Init(p).observations.filter(x=>x.state==='filtered');if(filteredOnly.length)content+=oac4Tip(`Your evidence contains <b>${filteredOnly.length} filtered port observations</b>. Do not treat them as open or as confirmed vulnerabilities. If you manage the firewall, compare expected ACLs and test again only from a permitted vantage point.`,'warn');
+ return content||oac4Tip('Upload at least one scan file and the appropriate next commands will appear here.');}
+function oac4Recon(p){oac4Init(p);return `<div class="oac4-flowline"><b>01 Run payloads</b><span>→</span><b>02 Transfer loot</b><span>→</span><b>03 Import all folders</b><span>→</span><b>04 Let FieldOps analyze</b></div>${oac3Scope(p)}${oac4Checklist(p)}${oac4TransferMini(p)}${oac4Upload()}${oac4EvidenceCard(p)}<div class="actions-row"><button class="btn primary" data-phase="1">Next: view automatic enumeration →</button></div>`}
+function oac4Enumeration(p){return `${oac4EvidenceCard(p)}${foPanel('Automatic asset inventory','No second uploader here. Import all batches once in Recon, and this inventory updates automatically.',`${assetsTable(p)}<div class="actions-row"><button class="btn small-btn" type="button" data-phase="0">↩ Add more evidence in Recon</button></div>`,'IDENTIFIED HOSTS & SERVICES')}${foPanel('What should I scan next?','Recommendations are generated only from available evidence and the scope saved once.',oac4NextSteps(p),'NEXT BEST ACTION')}<div class="actions-row"><button class="btn primary" data-phase="2">Next → Vulnerability checks</button></div>`;}
+function oac4Vulnerability(p){const old=oac3Vuln(p);return old.replace(oac3Upload(),`<div class="oac4-reimport">Finished a new Kali command? <button class="btn small-btn" data-phase="0">Return to the single evidence inbox →</button> All phases update when the results are imported.</div>`);}
+function oac4QueueId(file){return [file.webkitRelativePath||file.name,file.size,file.lastModified||0].join('|');}
+function oac4Add(files){let added=0,skipped=0;for(const file of files){if(oac4Queue.size>=150){skipped++;continue;}if(!OAC4_EXT.test(file.name)||file.size>2*1024*1024){skipped++;continue;}if([...oac4Queue.values()].reduce((n,f)=>n+f.size,0)+file.size>40*1024*1024){skipped++;continue;}const key=oac4QueueId(file);if(!oac4Queue.has(key)){oac4Queue.set(key,file);added++;}}oac4ShowQueue(skipped);return added;}
+function oac4ShowQueue(skipped=0){const el=document.getElementById('oac4-queued');if(!el)return;const list=[...oac4Queue.entries()];el.innerHTML=`<div class="oac4-queuehead"><b>${list.length} selected file${list.length===1?'':'s'}</b>${skipped?`<small>${skipped} unsupported / too-large / over-limit file(s) skipped</small>`:''}</div>${list.slice(0,40).map(([key,file])=>`<div class="oac4-qrow"><span>${e(file.webkitRelativePath||file.name)}</span><button type="button" class="btn small-btn ghost" data-oac4-remove="${e(key)}">Remove</button></div>`).join('')}${list.length>40?`<p class="tiny">...plus ${list.length-40} more files queued</p>`:''}`;}
+async function oac4ReadEntry(entry){if(entry.isFile)return new Promise((resolve,reject)=>entry.file(f=>resolve([f]),reject));if(!entry.isDirectory)return [];
+ const reader=entry.createReader(),children=[];for(;;){const batch=await new Promise((resolve,reject)=>reader.readEntries(resolve,reject));if(!batch.length)break;children.push(...batch);if(children.length>1000)break;}
+ const out=[];for(const child of children){if(out.length>500)break;out.push(...(await oac4ReadEntry(child)))}return out;}
+async function oac4FromDrop(dt){const entries=[...(dt.items||[])].filter(x=>x.kind==='file').map(x=>x.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){const files=[];for(const entry of entries){files.push(...(await oac4ReadEntry(entry)));if(files.length>=500)break;}oac4Add(files);}else oac4Add([...(dt.files||[])]);}
+const oac4PriorStep=stepAdvice;stepAdvice=function(p){if(ui.phase===0)return `<section class="panel tight"><div class="section-kicker">HOW THIS WORKS</div><h3 class="subheading">Run the relevant payloads, transfer the loot, then import everything into the single inbox below.</h3><p class="small">No duplicate upload pages or manually entered payload names.</p></section>`;
+ if(ui.phase===1)return `<section class="panel tight"><div class="section-kicker">NEXT BEST ACTION</div><h3 class="subheading">Open the generated scan command for the evidence you actually collected.</h3><p class="small">To add results from another Shark Jack or Kali scan, revisit the same evidence inbox in Recon.</p></section>`;return oac4PriorStep(p)};
+recon=oac4Recon;enumeration=oac4Enumeration;vulnerability=oac4Vulnerability;
+const oac4PriorShell=shell;shell=function(p){return oac4PriorShell(p).replace('OAC FIELDOPS / v3.0','OAC FIELDOPS / v4.0');};
+// Capture UI controls without interfering with vault, report and existing source parsers.
+document.addEventListener('change',ev=>{const el=ev.target;if(!el)return;if(el.id==='oac4-file-input'||el.id==='oac4-folder-input'){ev.stopImmediatePropagation();oac4Add([...el.files]);el.value='';}else if(el.id==='oac4-os'){ev.stopImmediatePropagation();ui.oac4OS=el.value;render()}},true);
+document.addEventListener('dragover',ev=>{if(ev.target?.closest?.('#oac4-drop')){ev.preventDefault();ev.dataTransfer.dropEffect='copy';}},true);
+document.addEventListener('drop',ev=>{if(!ev.target?.closest?.('#oac4-drop'))return;ev.preventDefault();oac4FromDrop(ev.dataTransfer).catch(fail)},true);
+document.addEventListener('click',ev=>{const b=ev.target?.closest?.('#oac4-import,#oac4-clear,[data-oac4-remove]');if(!b)return;ev.preventDefault();ev.stopImmediatePropagation();if(b.id==='oac4-clear'){oac4Queue.clear();oac4ShowQueue();return;}if(b.dataset.oac4Remove!==undefined){oac4Queue.delete(b.dataset.oac4Remove);oac4ShowQueue();return;}if(oac4Importing)return;const p=current();if(!p){fail(Error('Unlock your workspace first'));return;}if(!oac4Queue.size){fail(Error('Add some scan files or a folder first'));return;}oac4Importing=true;b.disabled=true;const files=[...oac4Queue.values()];importFiles(p,files).then(()=>{oac4Queue.clear();oac4ShowQueue()}).catch(fail).finally(()=>{oac4Importing=false;b.disabled=false})},true);
+
+/* OAC FieldOps 5.0 — the Shark Jack custom-payload runbook leads; transfer and parsing happen in Enumeration.
+ * Additive UI layer: preserves existing encrypted vault, tests, finding correlation and report engine.
+ * No external requests, no command execution, no credential-spray suggestions.
+ */
+'use strict';
+const OAC5_VERSION = '5.0';
+// Update only the descriptions, not the encrypted engagement structure or phase IDs.
+PHASES[0].summary = 'Follow the exact OAC Shark Jack menus to collect host and service evidence. No manual payload logging.';
+PHASES[1].summary = 'Copy the full Shark Jack loot tree once, import all files and folders, and let FieldOps assemble the inventory.';
+function oac5Path(name){return `<code class="oac5-path">My Payloads → OAC → ${e(name)}</code>`;}
+function oac5Item(num,name,tag,subtitle,steps,details,open=true){
+ const lines=steps.map((s,i)=>`<div class="oac5-step"><span class="oac5-step-num">${i+1}</span><div>${s}</div></div>`).join('');
+ return `<details class="oac5-payload" ${open?'open':''}><summary><span class="oac5-number">${e(num)}</span><span class="oac5-summarytext"><b>${e(name)}</b><small>${e(subtitle)}</small></span><span class="oac5-tag">${e(tag)}</span><span class="oac5-chevron">▾</span></summary><div class="oac5-body">${lines}${details?`<div class="oac5-evidencehint">${details}</div>`:''}</div></details>`;
+}
+function oac5Recon(p){
+ const ok=scopeSafety(p), scope=ok?p.scope:'not saved yet';
+ const ips=p.assets.filter(a=>isInScope(a.host,p.scope)).map(a=>a.host);
+ const common=ips.slice(0,5), smb=p.assets.filter(a=>isInScope(a.host,p.scope)&&a.ports.some(x=>Number(x.port)===445)).map(a=>a.host);
+ const ctx=oac3Init(p).context, knownGateway=ctx.gateway&&validIPv4(ctx.gateway)?ctx.gateway:null;
+ return `<div class="oac5-band"><span><b>01 RECON</b> — Run the Shark Jack payloads</span><span>→</span><span><b>02 ENUM</b> — Transfer + import everything</span><span>→</span><span><b>03–06</b> — Investigate + report</span></div>
+ ${oac3Scope(p)}
+ ${foPanel('Your exact OAC Shark Jack runbook','Use the revised payloads in My Payloads → OAC. You do NOT have to type their names, file paths, host counts, or findings into FieldOps.',`
+ <div class="oac5-notice"><b>Before starting:</b> Plug the Shark Jack into a LAN you own or are authorized to test. Use <code>DHCP_CLIENT</code> on an existing DHCP network. Confirm the saved engagement scope covers the complete connected LAN before running subnet-wide tools. <b>Never use DHCP_SERVER on an existing production LAN.</b></div>
+ ${oac5Item('01','Simple Connection Test','BASELINE','Original Hak5 utility · connectivity only',[
+ `Open <code>Downloaded → util → simple_connection_test</code>, then choose <b>Start</b>.`,
+ `The built-in test obtains DHCP, checks the gateway, then tries internet IP, DNS/HTTP(S), and public-IP checks. These are its actual internal steps; there is no separate host-timeout menu.`,
+ `If the gateway test fails, fix the cable/network settings first. <b>Internet failure alone doesn't prevent local authorized scanning.</b>`
+ ],'This stock utility mainly shows results on-screen. It does <b>not</b> reliably write a loot file; you can continue without one.')}
+ ${oac5Item('02','OAC_Advanced_Ping','GATEWAY','Revised OAC · automatically chooses the gateway',[
+ `Open ${oac5Path('OAC_Advanced_Ping')} and select <b>Ping Gateway</b>.`,
+ `The payload reads the current DHCP default gateway for you. <b>Do not enter an IP manually.</b> It sends <b>4 pings</b> by default, with a <b>2-second response wait</b> per probe.`,
+ `If the gateway responds, continue. If not, check connection details; ICMP might be blocked. ${knownGateway?`Your earlier imported gateway was <code>${e(knownGateway)}</code>; check it's still current.`:'Your gateway can change between networks.'}`
+ ],'Saved automatically to <code>/root/loot/ping/ping-*.txt</code>. “Ping Saved Target” is optional for checking a specific known device—not required for every host.')}
+ ${oac5Item('03','OAC_Network_Hunter','MAIN DISCOVERY','Revised OAC · actual IP list + XML output',[
+ `Open ${oac5Path('OAC_Network_Hunter')}. Choose <b>1 Discover Hosts</b>. Wait for the live-host count; do not unplug early.`,
+ `Next choose <b>2 Scan Live Services</b>. It uses the host list from Step 1, scanning the <b>top 1,000 TCP ports</b> and performing light version detection. The script allows <b>300 seconds per host</b>; it may take several minutes.`,
+ `Alternatively, on a fresh run choose <b>Discovery + Services</b> to do both in sequence. You do not need to run each separately <em>and</em> the combined option.`,
+ `If it says <b>over 32 hosts</b>, the built-in enumeration deliberately stops; use Advanced Nmap on individual in-scope targets instead. If it says <b>FAILED_OR_INCOMPLETE</b>, collect the saved error log.`
+ ],'Creates <code>/root/loot/network_hunter/discovery_*.txt/.xml</code>, <code>services_*.txt/.xml</code>, summaries, and <code>latest-hosts.txt</code>. These are the most useful FieldOps files.')}
+ ${oac5Item('04','OAC_Advanced_Nmap','FOLLOW-UP','Revised OAC · targeted scan from the actual menus',[
+ `Open ${oac5Path('OAC_Advanced_Nmap')} → <b>Options → Change Options</b>. Leave <b>NETMODE: DHCP_CLIENT</b>.`,
+ `If Hunter omitted IPs, choose <b>Target → SUBNET</b>, then <b>Scan Type → Ping</b> (<code>-sn</code>). Do <b>not</b> select Passive (<code>-sL</code>); that only lists potential addresses.`,
+ `Once you have an individual approved IP (from Hunter's screen or your imported asset inventory), choose <b>Target → IP address</b>, then <b>Scan Type → Port → Top-1000</b>.`,
+ `To fingerprint an identified host, choose <b>Scan Type → Service → Fast</b> (light version scan). The <b>Port</b> and <b>Service</b> options are separate runs, so save results from both.`,
+ `Under <b>Advanced</b>, the revised default is <b>Host Timeout: 300s</b> and <b>Max Retries: 3</b>. Verify via <b>Options → Show Options</b>—an old saved profile can override the defaults. Then choose <b>Start Scan</b>.`,
+ `Need more coverage on <em>one</em> approved host? <b>Port → All</b> is slower; it should not be your first full-subnet scan. If it times out, collect its raw log and XML before retrying.`
+ ],`Outputs <code>/root/loot/nmap/scan-*.txt</code> and <code>scan-*.xml</code>. ${common.length?`Already identified IPs in this engagement: <b>${e(common.join(', '))}</b>. Confirm they still belong to the authorized target.`:'You can select a specific host after discovery; do not guess an IP.'}`)}
+ ${oac5Item('05','OAC_SMB_Spy','CONDITIONAL','Revised OAC · port 445 discovery across the directly connected subnet',[
+ `Open ${oac5Path('OAC_SMB_Spy')} → <b>Start SMB Spy</b> <b>only if your whole connected subnet is approved for scanning</b> and SMB verification is relevant.`,
+ `It first performs host discovery, then checks <code>445/tcp</code> across the current LAN. It saves the <b>actual open/filtered/closed states</b>.`,
+ `If your earlier scan shows only <b>filtered</b> or <b>closed</b> TCP/445, this is optional rather than a guaranteed useful next action. It does not authenticate or enumerate file contents.`
+ ],`Saves <code>/root/loot/smb_discovery/smb_hosts_*.txt</code>, <code>nmap_raw_*.txt</code>, and <code>nmap_raw_*.xml</code>. ${smb.length?`Imported evidence has TCP/445 reported open on ${e(smb.join(', '))}.`:'No in-scope host with confirmed open TCP/445 is recorded yet.'}`,false)}
+ <div class="oac5-notice"><b>What we are <em>not</em> running:</b> The original downloaded Network Hunter's “Run All” included credential attempts. Your <b>revised OAC Network Hunter does not</b>; its menu contains only <b>Discover Hosts, Scan Live Services, Discovery + Services, Loot Folder, Quit</b>. LLDP tools can be used separately to learn about an owned managed switch when relevant; demos and credential-spray payloads are not part of this standard discovery sequence.</div>
+ <div class="oac5-finish"><b>That's Phase 01 complete.</b> You don't need to enter results here. Leave the loot on the Shark Jack until you're ready to copy it, then open Phase 02. <button class="btn primary" data-phase="1">02 → Transfer + import loot</button></div>
+ `,'PAYLOAD RUNBOOK')}`;
+}
+function oac5Transfer(p){const m=oac3Init(p), ctx=m.context;
+ const ip=(m.managementIp&&m.managementIp!=='172.16.24.1'?m.managementIp:(p.fieldops.managementIp&&p.fieldops.managementIp!=='172.16.24.1'?p.fieldops.managementIp:(ctx.deviceIp&&validIPv4(ctx.deviceIp)?ctx.deviceIp:'172.16.24.1')));
+ const os=ui.oac4OS||'windows';
+ const list=os==='windows'?
+ [ ['1 · List saved output files',`ssh root@${ip} "find /root/loot -type f -print"`,'Run in Windows PowerShell; this executes the find command remotely without leaving PowerShell.'],
+ ['2 · Create one destination folder',`$dest = Join-Path $HOME 'Documents\\FieldOps-Loot'; New-Item -ItemType Directory -Force -Path $dest | Out-Null`,'Creates your Windows evidence folder; no need to manually combine folders.'],
+ ['3 · Copy EVERYTHING under /root/loot',`scp -O -r root@${ip}:/root/loot $dest`,'Use -O for legacy SCP on the Shark Jack. This copies the whole loot tree and its subfolders, NOT workstation documents.'],
+ ['4 · See all copied evidence',`Get-ChildItem -Path $dest -Recurse -File | Select-Object FullName,Length`,'In the upload box below choose Add folder, then select Documents\\FieldOps-Loot\\loot.'] ]:
+ [ ['1 · List saved output files',`ssh root@${ip} 'find /root/loot -type f -print'`,'Run in your local Kali terminal.'],
+ ['2 · Create one destination folder','mkdir -p "$HOME/Documents/FieldOps-Loot"','All Shark Jack payload outputs will go into this one folder.'],
+ ['3 · Copy the complete loot tree',`scp -O -r root@${ip}:/root/loot "$HOME/Documents/FieldOps-Loot/"`,'Use -O if your Shark Jack cannot serve SFTP. The resulting directory includes every saved subfolder.'],
+ ['4 · View all saved evidence','find "$HOME/Documents/FieldOps-Loot/loot" -type f -print','In the upload box below choose Add folder and select Documents/FieldOps-Loot/loot.'] ];
+ return foPanel('Copy the WHOLE Shark Jack loot folder to your computer','Run these steps after your payloads finish. You only need one recursive SCP copy—no more downloading individual files from different folders.',`
+ <div class="oac4-transferbar"><label>Your computer<select id="oac4-os"><option value="windows" ${os==='windows'?'selected':''}>Windows PowerShell</option><option value="kali" ${os==='kali'?'selected':''}>Kali / Linux</option></select></label><form data-oac3="mgmt"><label>Current Shark Jack SSH IP</label><input type="text" name="ip" value="${e(ip)}" required><button class="btn small-btn" type="submit">Save IP</button></form></div>
+ <div class="oac5-notice"><b>Important:</b> The IP in these commands is the device's <em>current</em> SSH address. It can change after DHCP renewals. If the suggested address doesn't match what your device shows, edit it above and choose <b>Save IP</b> before copying. Commands are run on your laptop, <b>not</b> at <code>root@shark:~#</code>.</div>
+ <div class="oac4-cmdlist">${list.map(([title,cmd,why])=>oac4Command(title,cmd,why,null,p)).join('')}</div>
+ <details class="oac5-help"><summary>Why is SCP failing? ▾</summary><p>If SSH works but SCP fails with an SFTP-related error, keep the <code>-O</code> flag. If you're inside <code>root@shark:~#</code>, type <code>exit</code> and retry from Windows PowerShell/Kali. If the address isn't reachable, confirm Shark Jack management mode and IP.</p></details>
+ `,'TRANSFER / WINDOWS OR KALI');
+}
+function oac5Enumeration(p){const s=oac4Stats(p); const any=p.sources.length>0;
+ return `<div class="oac5-band"><span><b>01</b> Run OAC payloads</span><span>→</span><span><b>02</b> Transfer + import logs</span><span>→</span><span><b>03–06</b> Use identified findings</span></div>
+ ${oac5Transfer(p)}
+ ${oac4Upload().replace('ONE EVIDENCE INBOX · PHASE 01','ONE EVIDENCE INBOX · PHASE 02').replace('Import once. Add files from as many folders as you need.','Drop your entire Shark Jack loot folder here').replace('The app analyzes your files locally, connects host/port observations, and carries them into all six phases. Later scans go into this <em>same inbox</em>—not another form.','Choose <b>+ Add folder</b> and select the copied <code>loot</code> directory. Or add files and folders in several batches. FieldOps merges them by file hash; repeat imports are skipped. This is the <b>only</b> upload area for every phase.')}
+ ${foPanel('What FieldOps learned from your files','As soon as you analyze the queue, IP addresses, listening ports, closed/filtered results and scan warnings appear here. No manual transcription required.',`${!any?'<div class="oac5-notice">No loot imported yet. Finish the four transfer commands above, select the copied <code>loot</code> folder, and click <b>Analyze queued loot</b>.</div>':''}${oac4EvidenceCard(p)}${assetsTable(p)}`,'AUTOMATIC INVENTORY')}
+ ${foPanel('Exactly what to do next','If a scan finds no services, FieldOps distinguishes missing evidence, filtered ports, host-discovery failures, and a completed scan with no open listeners.',`${oac4NextSteps(p)}<div class="actions-row"><button class="btn primary" data-phase="2">03 → Vulnerability checks</button></div>`,'NEXT STEP ENGINE')}`;
+}
+function oac5Vulnerability(p){return oac3Vuln(p).replace(oac3Upload(),`<div class="oac4-reimport"><b>Finished a new scan?</b> <button class="btn small-btn" data-phase="1">02 → Import its results in the same evidence inbox</button><span>Findings and linked tests update after analysis.</span></div>`);}
+// Reuse the mature parser while supporting new OAC Network Hunter summaries and plain IP lists.
+const oac5PreviousScan=parseScan;
+parseScan=function(text,filename){const prior=oac5PreviousScan(text,filename);const seen=new Set(prior.map(a=>a.host));const name=String(filename||'').split(/[\\/]/).pop().toLowerCase();
+ const lines=String(text||'').replace(/\r/g,'').split('\n');
+ if(/^latest-hosts\.txt$/.test(name)||/^discovery_summary_/.test(name)||/^services_summary_/.test(name)){
+  let reading=false;
+  for(const line of lines){
+   if(/^Discovered IPs:\s*$/i.test(line)){reading=true;continue;}
+   const solo=line.trim();
+   if((reading||name==='latest-hosts.txt')&&validIPv4(solo)&&!seen.has(solo)){
+    prior.push({host:solo,hostname:'',ports:[]});seen.add(solo);continue;}
+   if(reading&&solo&&!validIPv4(solo))reading=false;
+   const row=line.match(/^\s*((?:\d{1,3}\.){3}\d{1,3})\s*\|\s*(\d{1,5})\/(tcp|udp)\s*\|\s*(open|filtered|closed)\s*\|\s*(\S+)/i);
+   if(row&&validIPv4(row[1])&&row[4]==='open'&&Number(row[2])>0&&Number(row[2])<=65535){
+    let asset=prior.find(a=>a.host===row[1]);if(!asset){asset={host:row[1],hostname:'',ports:[]};prior.push(asset);seen.add(row[1]);}
+    asset.ports.push({port:Number(row[2]),protocol:row[3],service:row[5],state:'open',source:filename});
+   }
+  }
+ }
+ return prior;
+};
+const oac5OldEvidence=oac4Evidence;
+oac4Evidence=function(text,filename){const r=oac5OldEvidence(text,filename),t=String(text||'');
+ if(/===\s*OAC Network Hunter: (?:Discovery|TCP Enumeration)\s*===/i.test(t)){
+   r.type=/TCP Enumeration/i.test(t)?'OAC Hunter service summary':'OAC Hunter discovery summary';
+   const c=t.match(/Live host records:\s*(\d+)/i);if(c)r.reported=Number(c[1]);
+   const h=parseScan(t,filename);for(const a of h){if(!r.hosts.includes(a.host)){r.hosts.push(a.host);r.hostRows.push({ip:a.host,state:'up'});}
+    for(const port of a.ports||[])r.ports.push({host:a.host,port:port.port,protocol:port.protocol,state:'open',service:port.service});}
+ }
+ if(/^latest-hosts\.txt$/i.test(String(filename||'').split(/[\\/]/).pop())){r.type='OAC Hunter host list';const h=parseScan(t,filename);for(const a of h){if(!r.hosts.includes(a.host)){r.hosts.push(a.host);r.hostRows.push({ip:a.host,state:'up'});}}}
+ if(/Status:\s*FAILED_OR_INCOMPLETE|OAC_SCAN_EXIT_STATUS=([1-9]\d*)/i.test(t))r.warnings.push('Scan explicitly reported failure or a nonzero exit status. Do not treat missing services as evidence that ports are closed.');
+ if(/Status:\s*PARTIAL_CHECK_FOR_TIMEOUTS|\bGiving up on host\b|\bhost timed out\b/i.test(t))r.warnings.push('Scan may be incomplete because of a host timeout; check raw output and consider retesting the one approved target.');
+ return r;
+};
+recon=oac5Recon;enumeration=oac5Enumeration;vulnerability=oac5Vulnerability;
+const oac5OldChecklist=checklist;
+checklist=function(p){if(ui.phase===0)return '';return oac5OldChecklist(p);};
+const oac5OldShell=shell;shell=function(p){return oac5OldShell(p).replace('OAC FIELDOPS / v4.0','OAC FIELDOPS / v5.0')};
+stepAdvice=function(p){if(ui.phase===0)return `<section class="panel tight"><div class="section-kicker">YOUR NEXT ACTION</div><h3 class="subheading">Run the actual OAC payload menu on the Shark Jack; don't enter results manually.</h3><p class="small">Begin with connection testing, Ping Gateway and Network Hunter. Use Advanced Nmap for specific targets. Move to Phase 02 for transfer and parsing.</p></section>`;
+ if(ui.phase===1)return `<section class="panel tight"><div class="section-kicker">YOUR NEXT ACTION</div><h3 class="subheading">Copy /root/loot once, import the whole folder, then follow the automatically generated next action.</h3><p class="small">New Kali results can be imported through this same inbox later. No duplicate upload forms.</p></section>`;
+ return `<section class="panel tight"><div class="section-kicker">HOW IT CONNECTS</div><h3 class="subheading">Your later phases use the evidence already imported in Phase 02.</h3><p class="small">Vulnerability checks propose commands only for observed open ports. Exploitation results need human confirmation and permission.</p><button class="btn small-btn" data-phase="1">Open the evidence inbox →</button></section>`;
+};
+
+/* OAC FieldOps 6 — Kali Phase 03 evidence intake and outcomes.
+   Additive upgrade: Phase 01/02 unaffected. No direct device execution or network access.
+   Assessment records live inside the existing AES-GCM encrypted engagement.
+ */
+'use strict';
+const OAC6_VERSION='6.0';
+const oac6Queue=new Map();
+let oac6SelectionId=0;
+let oac6Busy=false;
+function oac6State(p){foDefaults(p);if(!p.fieldops.v6)p.fieldops.v6={scans:[]};return p.fieldops.v6;}
+function oac6Key(h,port,protocol='tcp'){return `${h}|${Number(port)}|${protocol}`;}
+function oac6Expected(p){return oac3AllChecks(p).filter(c=>isInScope(c.host,p.scope));}
+function oac6Filename(f){return f.webkitRelativePath||f.name;}
+function oac6FileId(f){return `${++oac6SelectionId}|${oac6Filename(f)}|${f.size}`;}
+function oac6PendingSummary(p,c){const rows=oac6State(p).scans.filter(x=>x.host===c.host&&x.port===Number(c.port)&&x.protocol==='tcp');return rows.sort((a,b)=>String(b.at).localeCompare(String(a.at)))[0]||null;}
+function oac6Read(text,name){
+ const result={name,format:'other',exit:'unknown',hosts:[],ports:[],scripts:[],cmd:'',warnings:[],complete:false};
+ const t=String(text||'');
+ const xml=/^\s*(?:<\?xml\b|<nmaprun\b)/i.test(t);
+ if(xml){
+  result.format='xml';
+  const doc=new DOMParser().parseFromString(t,'application/xml');
+  if(doc.querySelector('parsererror')){result.exit='invalid';result.warnings.push('Malformed XML');return result;}
+  const root=doc.querySelector('nmaprun');if(!root){result.exit='invalid';return result;}
+  result.cmd=root.getAttribute('args')||'';
+  const end=root.querySelector(':scope > runstats > finished');
+  result.exit=end?.getAttribute('exit')||'unknown';
+  result.complete=!!end&&result.exit==='success';
+  if(end?.getAttribute('errormsg'))result.warnings.push((end.getAttribute('errormsg')||'').slice(0,200));
+  for(const host of root.querySelectorAll(':scope > host')){
+   const h=[...host.querySelectorAll(':scope > address')].find(el=>el.getAttribute('addrtype')==='ipv4')?.getAttribute('addr');
+   if(!validIPv4(h||''))continue;result.hosts.push(h);
+   for(const port of host.querySelectorAll(':scope > ports > port')){
+    const num=Number(port.getAttribute('portid')),protocol=port.getAttribute('protocol')||'tcp';
+    if(!Number.isInteger(num)||num<1||num>65535)continue;
+    const state=port.querySelector(':scope > state')?.getAttribute('state')||'unknown';
+    const svc=port.querySelector(':scope > service');
+    const product=[svc?.getAttribute('product'),svc?.getAttribute('version'),svc?.getAttribute('extrainfo')].filter(Boolean).join(' ').slice(0,140);
+    result.ports.push({host:h,port:num,protocol,state,service:svc?.getAttribute('name')||'unknown',version:product});
+    for(const script of port.querySelectorAll(':scope > script'))result.scripts.push({host:h,port:num,protocol,id:script.getAttribute('id')||'',output:(script.getAttribute('output')||'').slice(0,300),tlsProtocols:[...new Set((script.getAttribute('output')||'').match(/TLSv1\.[0-3]/g)||[])],tlsGrade:(script.getAttribute('output')||'').match(/least strength:\s*([A-F])/i)?.[1]||''});
+   }
+  }
+ }else{
+  result.format='text';
+  const commandLine=t.match(/^\s*(?:sudo\s+)?nmap\s+-[^\n]+/m);
+  result.cmd=commandLine?.[0]||'';
+  let current='';
+  for(const line of t.split(/\r?\n/)){
+   const host=line.match(/^Nmap scan report for\s+(?:.*?\()?((?:\d{1,3}\.){3}\d{1,3})\)?\s*$/i);
+   if(host){current=host[1];if(validIPv4(current))result.hosts.push(current);continue;}
+   const port=line.match(/^\s*(\d{1,5})\/(tcp|udp)\s+(open|filtered|closed|open\|filtered)\s+(\S+)(?:\s+(.*))?/i);
+   if(port&&validIPv4(current))result.ports.push({host:current,port:Number(port[1]),protocol:port[2],state:port[3],service:port[4],version:(port[5]||'').slice(0,140)});
+  }
+  if(/Nmap done:\s*\d+ IP address(?:es)?/i.test(t)){result.complete=true;result.exit='success';}
+  if(/QUITTING!|Nmap:.*ERROR|ERROR:\s|Failed to resolve|Operation not permitted/i.test(t)){result.exit='error';result.complete=false;result.warnings.push('Nmap reported an error');}
+ }
+ if(/timed out|giving up on host|received SIGINT|QUITTING!|aborted|FAILED_OR_INCOMPLETE/i.test(t)){result.complete=false;result.exit='partial';result.warnings.push('Potential timeout or incomplete scan');}
+ result.hosts=[...new Set(result.hosts)];
+ return result;
+}
+function oac6CmdHostPort(cmd,host,port){
+ const escaped=host.replace(/\./g,'\\.');
+ if(!new RegExp('(?:^|[^0-9.])'+escaped+'(?=$|[^0-9.])').test(cmd||''))return false;
+ const m=(cmd||'').match(/(?:^|\s)-p\s+([\d,\-]+)/);
+ if(!m)return false;
+ return m[1].split(',').some(s=>{const range=s.split('-').map(Number);return range.length===1?range[0]===Number(port):(Number(port)>=range[0]&&Number(port)<=range[1]);});
+}
+function oac6Correlate(r,check,manual=false){
+ const matches=r.ports.filter(x=>x.host===check.host&&x.port===Number(check.port)&&x.protocol==='tcp');
+ const cargs=oac6CmdHostPort(r.cmd,check.host,check.port);
+ // Host/port evidence is necessary. A filename alone is not trusted.
+ if(!matches.length&&!cargs)return null;
+ const port=matches[0]||null;
+ const scripts=r.scripts.filter(x=>x.host===check.host&&x.port===Number(check.port));
+ let outcome='review',note='Scan output is incomplete or lacks a clear conclusion.';
+ if(r.exit==='invalid'||r.exit==='partial'||r.exit==='error'){outcome='incomplete';note=r.warnings.join('; ')||'Nmap reported an error or the scan was interrupted';}
+ else if(port&&port.state!=='open'){outcome='no-listener';note=`Latest scan observed ${port.state} TCP/${port.port}. This is not vulnerability evidence.`;}
+ else if(!r.complete){outcome='incomplete';note='No completed Nmap run marker was found; verify the scan was allowed to finish.';}
+ else if(!port){outcome='needs-review';note='Command targets this IP:port, but the XML/text does not contain a returned port record.';}
+ else if(scripts.length){
+  const suspicious=scripts.some(s=>foDetection(s.id,s.output));
+  outcome=suspicious?'candidate':'script-reviewed';
+  note=suspicious?'A recognized script observation suggests a weakness; verify it before testing.':'Script output captured; no supported positive indicator was detected. Review raw output.';
+ }else if((check.cmd(check.host,check.port)||'').includes('--script')){outcome='needs-review';note='The command requested an NSE script but no matching script output was captured. Do not interpret this as a negative test.';}
+ else{outcome='fingerprinted';note=port.version?`Service fingerprint: ${port.version}`:'Version detection completed, but no product/version was identified. Neither proves a vulnerability.';}
+ return {outcome,note,service:port?.service||'',version:port?.version||'',portState:port?.state||'not returned',scripts:scripts.map(s=>s.id).slice(0,20),tlsProtocols:[...new Set(scripts.flatMap(s=>s.tlsProtocols||[]))],tlsGrade:scripts.find(s=>s.tlsGrade)?.tlsGrade||'',matchedBy:matches.length?'host/port evidence':'Nmap command target',manual};
+}
+function oac6QueueAdd(files,checkKey=''){
+ let count=0,skipped=0;
+ for(const file of files){if(!OAC4_EXT.test(file.name)||file.size>2*1024*1024){skipped++;continue;}if(oac6Queue.size>=80||[...oac6Queue.values()].reduce((a,x)=>a+x.file.size,0)+file.size>30*1024*1024){skipped++;continue;}
+  const key=oac6FileId(file);if(!oac6Queue.has(key)){oac6Queue.set(key,{file,checkKey});count++;}
+ }
+ oac6QueueUpdate(skipped);return count;
+}
+function oac6QueueUpdate(skipped=0){const el=document.getElementById('oac6-queue');if(!el)return;const files=[...oac6Queue.values()];el.innerHTML=`<div class="oac6-q-title"><b>${files.length} result file${files.length===1?'':'s'} ready</b>${skipped?`<small>${skipped} skipped (unsupported, larger than 2 MB, or over limit)</small>`:''}</div>${files.slice(0,12).map(({file,checkKey})=>`<div class="oac6-row"><span>${e(oac6Filename(file))}</span><small>${e(checkKey||'Auto-match by IP:port')}</small></div>`).join('')}${files.length>12?`<small>…and ${files.length-12} more</small>`:''}`;}
+async function oac6Import(p,items){
+ if(!scopeSafety(p))throw Error('Set your authorized scope before importing vulnerability scan results.');
+ const jobs=oac6Expected(p),stage=[];
+ for(const {file,checkKey} of items){if(file.size>2*1024*1024)throw Error('Each result must be 2 MB or smaller');const bytes=await file.arrayBuffer();const sha=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n=>n.toString(16).padStart(2,'0')).join('');const report=oac6Read(dec.decode(bytes),file.name);stage.push({file,checkKey,sha,report});}
+ // Reuse exactly the existing imports, NSE candidate detection, dedup, and encrypted vault.
+ await importFiles(p,items.map(x=>x.file));
+ const state=oac6State(p);let updates=0,misses=[];
+ for(const {file,checkKey,sha,report} of stage){
+  const source=p.sources.find(s=>s.sha===sha);if(!source)continue;
+  const matches=jobs.map(c=>({c,result:oac6Correlate(report,c,!!checkKey)})).filter(x=>x.result&&(!checkKey||checkKey===oac6Key(x.c.host,x.c.port)));
+  if(!matches.length){misses.push(file.name);continue;}
+  for(const {c,result} of matches){const existing=state.scans.find(x=>x.sha===sha&&x.host===c.host&&x.port===Number(c.port));if(existing)continue;
+   const findings=p.findings.filter(f=>f.host===c.host&&Number(f.autoPort)===Number(c.port)&&f.status!=='disproved');
+   if(findings.length&&result.outcome!=='incomplete'&&result.outcome!=='no-listener'){
+    result.outcome='candidate';result.note='A linked suspected/validated finding exists; review its source and verify the condition.';
+   }
+   state.scans.unshift({id:id(),at:time(),sha,sourceId:source.id,filename:file.name,host:c.host,port:Number(c.port),protocol:'tcp',name:c.name,tool:c.tool,...result});updates++;
+  }
+ }
+ state.scans=state.scans.slice(0,400);
+ log(p,`Phase 03 correlated ${updates} host/port check result(s); ${misses.length} unmatched file(s)`);
+ await persist();render();
+ message(`${updates} Phase 03 check result(s) matched. ${misses.length?misses.length+' file(s) did not match an open-service task.':''}`);
+ return {updates,misses};
+}
+function oac6Badge(s){const labels={candidate:'Suspected finding',fingerprinted:'Fingerprint captured','script-reviewed':'Script reviewed','no-listener':'Port not open',incomplete:'Incomplete / error','needs-review':'No script result',review:'Needs review'};return `<span class="oac6-pill ${e(s?.outcome||'pending')}">${e(labels[s?.outcome]||'Awaiting scan result')}</span>`;}
+function oac6Stage3Inbox(p){return foPanel('Add Kali scan results here','After running a command below, import its XML file or paste the COMPLETE terminal output. Do this here in Phase 03—there is no need to go back to Enumeration.',`
+ <div class="oac6-inbox"><div class="oac6-pickrow"><label class="btn" for="oac6-files">+ Add XML / text files</label><input id="oac6-files" type="file" accept=".xml,.txt,.nmap,.gnmap,.log,.csv" multiple hidden><label class="btn" for="oac6-folder">+ Add results folder</label><input id="oac6-folder" type="file" webkitdirectory directory multiple hidden><button class="btn small-btn ghost" type="button" id="oac6-clear">Clear selection</button></div><div class="oac6-drop" id="oac6-drop">Drop Nmap result files or a folder here (add several batches before analyzing)</div><div id="oac6-queue"><b>0 files selected</b></div><button type="button" class="btn primary" id="oac6-import">Analyze results → Update Phases 04–06</button></div>
+ <details class="oac6-paste"><summary>Or paste terminal output instead of uploading a file ▾</summary><p class="small">In Kali, select the terminal text and press <b>Ctrl+Shift+C</b>. Paste the full output (including the target IP, port line, script output and Nmap completion summary). A command line alone is not sufficient evidence.</p><form id="oac6-paste-form"><label>Terminal output</label><textarea name="output" required minlength="20" rows="7" placeholder="Starting Nmap...&#10;Nmap scan report for 10.10.10.1&#10;PORT STATE SERVICE&#10;53/tcp open domain&#10;Nmap done: 1 IP address..."></textarea><button class="btn small-btn primary" type="submit">Analyze pasted terminal output</button></form></details>
+ <div class="oac6-tip">In Kali, XML saved with <code>-oX oac-10.10.10.1-53-dns.xml</code> lands in your <b>current terminal directory</b>. Run <code>pwd</code> and <code>ls -lh oac-*.xml</code> to locate it. Open FieldOps in your Kali browser to select the file directly. If you use FieldOps on Windows, transfer the XML to Windows first. The browser does not automatically read your Kali terminal.</div>
+ `,'PHASE 03 · RESULTS INBOX');}
+function oac6Stage3Queue(p){const checks=oac6Expected(p);const completed=checks.filter(c=>oac6PendingSummary(p,c)).length;
+ const counts={complete:completed,total:checks.length};
+ const queue=checks.map(c=>{const matched=oac6PendingSummary(p,c);const related=p.findings.filter(f=>f.host===c.host&&Number(f.autoPort)===Number(c.port)&&f.status!=='disproved');const cmd=c.cmd(c.host,c.port);
+ return `<div class="oac6-task"><div class="oac6-head"><div><b>${e(c.host)}:${e(c.port)} — ${e(c.name)}</b><div class="small">${e(c.tool)} · ${e(c.service||'Service unverified')}</div></div>${oac6Badge(matched)}</div><p class="small">${e(c.why)}</p>${foCommand('Copy → Run on Kali',cmd,c.expect,c.host,p)}<div class="oac6-taskfoot"><label class="btn small-btn" for="oac6-task-${e(c.host.replaceAll('.','-'))}-${e(c.port)}">Upload this check’s XML / text</label><input type="file" id="oac6-task-${e(c.host.replaceAll('.','-'))}-${e(c.port)}" data-oac6-task="${e(oac6Key(c.host,c.port))}" accept=".xml,.txt,.nmap,.gnmap,.log" hidden><span class="small">${matched?`Imported ${e(matched.filename)} · ${e(date(matched.at))}`:'Run the command, then select the file it produced'}</span></div>${matched?`<div class="oac6-result"><b>Observed:</b> ${e(matched.note)}${matched.version?`<div class="small">Product/version: ${e(matched.version)}</div>`:''}${matched.scripts?.length?`<div class="small">NSE script(s): ${e(matched.scripts.join(', '))}</div>`:''}<div class="tiny">Evidence: SHA-256 ${e(matched.sha.slice(0,18))}… · ${e(matched.matchedBy)}</div></div>`:''}${related.length?`<div class="oac6-linked">Linked finding: ${related.map(f=>`<b>${e(f.title)}</b> (${e(f.status)})`).join(', ')} · <button class="btn small-btn" data-phase="3">Review in Phase 04 →</button></div>`:''}</div>`;}).join('');
+ return foPanel(`Kali investigation queue · ${completed} / ${checks.length} with results`,'Each command is generated from an observed in-scope open TCP service. The status updates automatically when matching result evidence is imported.',`${queue||'<div class="empty">There are no open TCP services with a follow-up check yet. Import your Shark Jack inventory in Phase 02.</div>'}`,'FINDINGS-DRIVEN CHECKLIST');}
+function oac6FindingPanel(p){const rows=p.findings.filter(f=>f.status!=='disproved');return foPanel('What goes to Phase 04?','Only evidence-backed candidates or manually validated findings become exploitation candidates. A completed scan with no recognized indicator does not prove a host is secure.',`${rows.length?rows.map(f=>`<div class="fo-finding"><b>${e(f.title)}</b> <span class="tag ${f.status==='validated'?'green':'yellow'}">${e(f.status)}</span><div class="small">${e(f.host)}:${e(f.autoPort||'—')} · ${e(f.sourceLabel||'Source in evidence register')}</div><p class="small">${e(f.evidence||'Evidence needs review')}</p><button class="btn small-btn" data-fo-review="${e(f.id)}">Review / validate</button><button class="btn small-btn" data-fo-exploit="${e(f.id)}">Open in Phase 04 →</button></div>`).join(''):'<div class="oac6-tip">No evidence-backed vulnerability candidates yet. Import XML containing actual NSE results, then review what was observed. Service banners alone are not vulnerabilities.</div>'}<div class="actions-row"><button class="btn primary" data-phase="3">04 → Review findings / controlled proof</button></div>`,'EVIDENCE → REVIEW');}
+function oac6Vulnerability(p){return `<div class="oac5-band"><span><b>02</b> Imported host inventory</span><span>→</span><span><b>03</b> Run Kali + import results HERE</span><span>→</span><span><b>04–06</b> Review / verify / report</span></div>${oac6Stage3Inbox(p)}${oac6Stage3Queue(p)}${oac6FindingPanel(p)}`;}
+function oac6Handoff(p){const scans=oac6State(p).scans,unique=[...new Set(scans.map(x=>oac6Key(x.host,x.port)))];return foPanel('Imported Kali results from Phase 03','Each result below came from an observed host/port and is stored with its source hash. Review suspected weaknesses before any controlled proof testing.',`<div class="oac3-statgrid"><div><b>${unique.length}</b><span>Services with Kali follow-up</span></div><div><b>${p.findings.filter(f=>f.status==='suspected').length}</b><span>Suspected findings</span></div><div><b>${p.findings.filter(f=>f.status==='validated').length}</b><span>Validated findings</span></div></div>${scans.length?`<div class="oac6-handoff-list">${scans.slice(0,15).map(r=>`<div><b>${e(r.host)}:${e(r.port)}</b> ${oac6Badge(r)} <span class="small">${e(r.note)}</span></div>`).join('')}</div>`:'<p class="small">No Phase 03 checks imported yet. Import the Kali results there first.</p>'}<div class="actions-row"><button class="btn small-btn" data-phase="2">↩ Return to Kali checks</button></div>`,'KALI → EXPLOITATION HANDOFF');}
+const oac6PreviousExploit=exploitation;exploitation=function(p){return oac6Handoff(p)+oac6PreviousExploit(p);};
+const oac6PreviousPost=postExploit;postExploit=function(p){const n=oac6State(p).scans.length;return `<div class="oac6-tip"><b>Kali evidence inherited:</b> ${n} correlated Phase 03 results. A vulnerability scan does not itself establish exploitation or system access; Phase 05 records actual approved proof and cleanup only.</div>`+oac6PreviousPost(p);};
+const oac6PreviousReport=report;report=function(p){return oac6Handoff(p)+oac6PreviousReport(p);};
+const oac6PreviousPlain=reportPlain;reportPlain=function(p){const rows=oac6State(p).scans;return oac6PreviousPlain(p)+`\n\n## Phase 03 — Kali verification log\n${rows.length?rows.map(s=>`- ${s.host}:${s.port} (${s.name}): ${s.outcome} — ${s.note} [${s.filename}, SHA-256 ${s.sha}]`).join('\n'):'No correlated Kali vulnerability checks imported.'}\n\nScanner output is observational evidence, not proof of exploitability.\n`;};
+const oac6PreviousHTML=reportHTML;reportHTML=function(p){const rows=oac6State(p).scans;return oac6PreviousHTML(p)+`<div class="report-sheet"><h3>Phase 03 — Kali verification register</h3><table><thead><tr><th>Host / port</th><th>Observation</th><th>Evidence source</th></tr></thead><tbody>${rows.map(s=>`<tr><td>${e(s.host)}:${e(s.port)}</td><td>${e(s.note)}</td><td>${e(s.filename)} · SHA-256 ${e(s.sha)}</td></tr>`).join('')||'<tr><td colspan="3">No correlated Kali vulnerability checks imported.</td></tr>'}</tbody></table><p>Scanner output alone does not establish a vulnerability or successful exploitation.</p></div>`;};
+vulnerability=oac6Vulnerability;
+const oac6OldShell=shell;shell=function(p){return oac6OldShell(p).replace('OAC FIELDOPS / v5.0','OAC FIELDOPS / v6.0');};
+const oac6PreviousAdvice=stepAdvice;stepAdvice=function(p){if(ui.phase===2)return `<section class="panel tight"><div class="section-kicker">YOUR NEXT ACTION</div><h3 class="subheading">Run a Kali check, then upload its result directly here.</h3><p class="small">The matching service card updates automatically. Evidence-backed candidate findings appear in Phase 04; no duplicate scope or inventory entry.</p></section>`;return oac6PreviousAdvice(p);};
+// Capture Phase 03 controls, but preserve Phase 01/02 handlers and vault controls.
+document.addEventListener('change',ev=>{const el=ev.target;if(!el)return;if(el.id==='oac6-files'||el.id==='oac6-folder'){ev.stopImmediatePropagation();oac6QueueAdd([...el.files]);el.value='';}else if(el.dataset.oac6Task){ev.stopImmediatePropagation();const p=current();if(!p)return;const files=[...el.files];el.value='';if(!files.length)return;oac6Import(p,files.map(file=>({file,checkKey:el.dataset.oac6Task}))).catch(fail);}},true);
+document.addEventListener('dragover',ev=>{if(ev.target?.closest?.('#oac6-drop')){ev.preventDefault();ev.dataTransfer.dropEffect='copy';}},true);
+document.addEventListener('drop',ev=>{if(!ev.target?.closest?.('#oac6-drop'))return;ev.preventDefault();const entries=[...(ev.dataTransfer.items||[])].filter(x=>x.kind==='file').map(x=>x.webkitGetAsEntry?.()).filter(Boolean);if(entries.length){Promise.all(entries.map(oac4ReadEntry)).then(rows=>oac6QueueAdd(rows.flat().slice(0,200))).catch(fail);}else{oac6QueueAdd([...(ev.dataTransfer.files||[])]);}},true);
+document.addEventListener('click',ev=>{const b=ev.target?.closest?.('#oac6-import,#oac6-clear');if(!b)return;ev.preventDefault();ev.stopImmediatePropagation();if(b.id==='oac6-clear'){oac6Queue.clear();oac6QueueUpdate();return;}if(oac6Busy)return;const p=current();if(!p){fail(Error('Unlock a workspace'));return;}if(!oac6Queue.size){fail(Error('Add an XML/text result first'));return;}oac6Busy=true;b.disabled=true;const rows=[...oac6Queue.values()];oac6Import(p,rows).then(()=>{oac6Queue.clear();oac6QueueUpdate()}).catch(fail).finally(()=>{oac6Busy=false;b.disabled=false});},true);
+document.addEventListener('submit',ev=>{if(ev.target?.id!=='oac6-paste-form')return;ev.preventDefault();ev.stopImmediatePropagation();const p=current();if(!p)return;const text=String(new FormData(ev.target).get('output')||'').trim();if(!/Nmap scan report for|<nmaprun\b/i.test(text)){fail(Error('Paste the actual Nmap scan output with its target host—not just the command'));return;}const file=new File([text],`kali-terminal-${Date.now()}.txt`,{type:'text/plain'});oac6Import(p,[{file,checkKey:''}]).catch(fail);},true);
+
+/* OAC FieldOps FINAL — unified phase 04/05/06 evidence and reporting.
+ * Loaded after original v1-v6 code in the single compiled app.js.
+ * Additive in-vault migration; no new network, shell or remote execution.
+ */
+'use strict';
+const FIELDOPS_RELEASE = '8.0 · Consolidated';
+// Improve Phase 03 text-output parity with XML: preserve per-port NSE script lines.
+// This affects recognition of terminal pastes, not the evidence-trust threshold.
+const oac7EarlierNmapRead=oac6Read;
+oac6Read=function(text,name){
+ const r=oac7EarlierNmapRead(text,name);
+ if(r.format!=='text')return r;
+ let host='',port=0,protocol='tcp',script='',buf=[];
+ const flush=()=>{if(host&&port&&script){r.scripts.push({host,port,protocol,id:script,output:oac7SafeText(buf.join('\n'),300)});}script='';buf=[];};
+ for(const raw of String(text||'').split(/\r?\n/)){
+  let m=raw.match(/^Nmap scan report for\s+(?:.*?\()?((?:\d{1,3}\.){3}\d{1,3})\)?\s*$/i);
+  if(m){flush();host=m[1];port=0;continue;}
+  m=raw.match(/^\s*(\d{1,5})\/(tcp|udp)\s+(open|filtered|closed)\b/i);
+  if(m){flush();port=+m[1];protocol=m[2].toLowerCase();continue;}
+  m=raw.match(/^\s*\|[_ ]?([a-z][\w-]+):\s*(.*)$/i);
+  if(m&&host&&port){flush();script=m[1];buf.push(m[2]||'');continue;}
+  if(script&&/^\s*\|/.test(raw)){buf.push(raw.replace(/^\s*\|[_ ]?/,''));continue;}
+  if(script&&raw.trim())flush();
+ }
+ flush();return r;
+};
+function oac7State(p){
+  foDefaults(p);oac6State(p);
+  if(!p.fieldops.v7 || typeof p.fieldops.v7!=='object')p.fieldops.v7={};
+  const s=p.fieldops.v7;
+  if(!Array.isArray(s.proofFiles))s.proofFiles=[];
+  if(!Array.isArray(s.postFiles))s.postFiles=[];
+  if(!Array.isArray(s.postRecords))s.postRecords=[];
+  return s;
+}
+const oac7ByTest=(p,testId)=>p.tests.find(x=>x.id===testId);
+const oac7Finding=(p,t)=>p.findings.find(x=>x.id===t?.findingId);
+const oac7Post=(p,testId)=>oac7State(p).postRecords.find(x=>x.testId===testId);
+const oac7Proof=(p,testId,stage='proof')=>(stage==='post'?oac7State(p).postFiles:oac7State(p).proofFiles).filter(x=>x.testId===testId);
+function oac7FieldStatus(t){
+ if(t.result==='Proof confirmed')return 'Proof confirmed — human reviewed';
+ if(t.result==='Configuration verified')return 'Configuration verified — no access required';
+ return t.result||'Not attempted';
+}
+function oac7SafeText(input,limit=900){
+ let s=String(input||'').replace(/\u0000/g,'').slice(0,6000);
+ s=s.replace(/(authorization\s*:\s*(?:basic|bearer)\s+)[^\s]+/gi,'$1[REDACTED]')
+ .replace(/((?:password|passwd|token|secret|api[_-]?key|authorization|cookie|sessionid)\s*[:=]\s*)[^\s,'";]+/gi,'$1[REDACTED]')
+ .replace(/-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----/g,'[PRIVATE KEY REDACTED]');
+ return s.slice(0,limit);
+}
+function oac7StageHeader(n,title,desc){return `<div class="oac7-stage"><span class="oac7-stage-n">${n}</span><div><h3>${e(title)}</h3><p>${e(desc)}</p></div></div>`}
+function oac7Empty(msg){return `<div class="oac7-empty">${e(msg)}</div>`}
+function oac7Tag(txt,kind='neutral'){return `<span class="oac7-tag ${e(kind)}">${e(txt)}</span>`}
+function oac7MiniMetric(n,l){return `<div class="oac7-metric"><strong>${e(n)}</strong><span>${e(l)}</span></div>`}
+function oac7SelectFinding(p){
+ const list=p.findings.filter(f=>f.status==='validated'&&isInScope(f.host,p.scope));
+ const selected=list.find(f=>f.id===ui.foFinding)||list[0];
+ return {list,selected};
+}
+function oac7Records(p,stage){
+ const s=oac7State(p),records=stage==='post'?s.postFiles:s.proofFiles;
+ return `<div class="oac7-evidence-catalog">${records.length?records.slice(0,100).map(x=>`<div class="oac7-evidence-row"><span>${e(x.filename)}</span><small>${e(x.kind)} · SHA-256 ${e(x.sha.slice(0,16))}… · ${e(x.at.slice(0,16))}</small></div>`).join(''):oac7Empty('No supporting files or pasted terminal output yet.')}</div>`;
+}
+function oac7FileIntake(testId,kind,heading){
+ return `<div class="oac7-file-intake"><b>${e(heading)}</b><p class="small">Upload a saved .txt, .xml, .log, .json, .csv or .md result. FieldOps records the SHA-256 hash and a short redacted excerpt; it does not declare a test successful.</p><input aria-label="Upload ${e(kind)} evidence" type="file" accept=".txt,.xml,.log,.json,.csv,.md" multiple data-oac7-file="${e(testId)}" data-oac7-kind="${e(kind)}"><form data-oac7-form="paste" data-oac7-test="${e(testId)}" data-oac7-kind="${e(kind)}"><label>Or paste the terminal result</label><textarea name="text" rows="3" placeholder="Paste actual output, not just the command. Remove secrets first." required maxlength="12000"></textarea><button class="btn small-btn" type="submit">Save pasted output</button></form></div>`;
+}
+function oac7Prereq(p){const validated=p.findings.filter(f=>f.status==='validated'&&isInScope(f.host,p.scope));const suspected=p.findings.filter(f=>f.status==='suspected'&&isInScope(f.host,p.scope));const scans=oac6State(p).scans;return `<div class="oac7-metrics">${oac7MiniMetric(scans.length,'Phase 03 scan results')}${oac7MiniMetric(suspected.length,'Suspected findings')}${oac7MiniMetric(validated.length,'Validated in-scope findings')}${oac7MiniMetric(p.tests.length,'Documented tests')}</div>`}
+function oac7Method(f){const meta=foMethod(f);const port=f?.autoPort||'';if(!f)return '';
+ if(meta && typeof meta.verify==='string')return meta.verify;
+ return `Confirm the exact affected service/version and prerequisite from the linked evidence on ${f.host}${port?':'+port:''}; consult vendor advisory; define the least-invasive verification and a clear stop condition.`;
+}
+function oac7Guidance(p,t){const f=oac7Finding(p,t),meta=foMethod(f);
+ const kind=/tls|signing|headers|cipher|security-mode|method/i.test(`${f?.autoKind||''} ${f?.title||''}`);
+ const detail=kind?'Configuration findings normally require a configuration/protocol verification, not shell access. Select “Configuration verified” only after reviewing the actual evidence.':'For other findings, verify exact product/version, prerequisites and authorization before choosing a controlled proof method. Avoid generic exploit recipes when evidence is insufficient.';
+ let cmd='';if(meta&&f&&f.status==='validated'&&p.exploitApproved&&t.findingId===f.id&&isInScope(t.host,p.scope)&&typeof meta.poc==='function'){
+   try{cmd=String(meta.poc(f.host,f.autoPort||'')).trim()}catch{}
+ }
+ return `<div class="oac7-guidance"><strong>Suggested validation approach</strong><p>${e(detail)}</p><p>${e(meta?.verify||'Use vendor documentation and existing Phase 03 service evidence for read-only confirmation.')}</p>${cmd?`<div class="oac7-cmd"><code>${e(cmd)}</code><button class="btn small-btn" data-oac7-copy="${e(t.id)}" data-oac7-command="${e(cmd)}">Copy approved read-only check</button></div>`:''}<p class="small">Stop at the first defensible observation. Never infer compromise from a banner, Nmap result, or a failed command.</p></div>`;
+}
+function oac7TestCard(p,t){const f=oac7Finding(p,t),list=oac7Proof(p,t.id),status=t.result||'Not attempted';const resultOpts=['Not attempted','Blocked — no authorization','Inconclusive','Not vulnerable','Configuration verified','Proof confirmed'];
+ return `<details class="oac7-test" ${ui.oac7Test===t.id?'open':''}><summary><span><b>${e(f?.title||t.objective||'Unlinked test')}</b><small>${e(t.host)} · ${e(date(t.at))} · ${e(t.objective||'')}</small></span>${oac7Tag(oac7FieldStatus(t),status==='Proof confirmed'||status==='Configuration verified'?'ok':'neutral')}</summary><div class="oac7-test-body"><div class="oac7-links">${f?`Linked finding: <b>${e(f.title)}</b> · ${e(f.status)} · ${e(f.host)}:${e(f.autoPort||'—')}`:'Legacy test without a finding link — link it through a new test for full traceability.'}</div>
+ ${oac7Guidance(p,t)}
+ ${oac7StageHeader('A','Run approved check and import observed output','Only use the planned method in the permitted assessment environment.')}
+ ${oac7FileIntake(t.id,'proof','Attach proof / terminal output to this exact test')}
+ <div class="oac7-attachments">${list.length?list.map(x=>`<div class="oac7-evidence-row"><b>${e(x.filename)}</b><small>SHA-256 ${e(x.sha.slice(0,20))}…</small><p class="small">${e(x.excerpt||'No text excerpt stored')}</p></div>`).join(''):oac7Empty('No supporting proof attached to this test.')}</div>
+ ${oac7StageHeader('B','Review and record the actual outcome','FieldOps will never mark proof as confirmed automatically.')}
+ <form data-oac7-form="outcome" data-oac7-test="${e(t.id)}" class="form-grid">
+ <div class="field"><label>Observed result</label><select name="result">${resultOpts.map(r=>`<option ${r===status?'selected':''}>${e(r)}</option>`).join('')}</select></div>
+ <div class="field"><label>Test / observation timestamp (local)</label><input name="atObserved" type="datetime-local" value="${e(t.atObserved||'')}"></div>
+ <div class="field full"><label>Exactly what you observed</label><textarea name="evidence" rows="4" maxlength="2500" placeholder="What did the authorized test demonstrate? Include important negative or uncertain results.">${e(t.evidence||'')}</textarea></div>
+ <div class="field full"><label>Method / scope / stop condition</label><textarea name="method" rows="3" maxlength="2000">${e(t.method||'')}</textarea></div>
+ <div class="field full"><label class="check-row"><input type="checkbox" name="verified"> I personally reviewed the output and the recorded outcome matches the evidence. Required when selecting Proof confirmed or Configuration verified.</label></div>
+ <div class="actions-row"><button class="btn primary" type="submit">Save reviewed test outcome</button><button class="btn" type="button" data-phase="4">05 → Impact and cleanup</button></div></form>
+ </div></details>`;
+}
+function oac7Exploit(p){oac7State(p);const {list,selected}=oac7SelectFinding(p);
+ return `${foContext(p)}${oac7Prereq(p)}${foPanel('04 · Controlled proof, linked to a validated finding','Plan a minimum-impact test, attach what actually happened, then explicitly classify the result. A verified configuration issue can be reported without exploitation.',`
+ ${oac7StageHeader('01','Review a validated finding','Suspected scanner observations must be validated in Phase 03 before entering a proof plan. The engagement authorization from Phase 01 carries forward automatically.')}
+ ${p.findings.some(f=>f.status==='suspected')?`<div class="oac7-alert">${e(p.findings.filter(f=>f.status==='suspected').length)} suspected finding(s) still need review. <button type="button" class="btn small-btn" data-phase="2">Review in Phase 03</button></div>`:''}
+ <div class="oac7-alert ${p.exploitApproved?'good':''}">${p.exploitApproved?`<b>All-phase authorization already saved for this engagement.</b> The approved scope is ${e(p.scope)}. No repeat permission form needed. Each test still needs a documented objective, stop condition and reviewed result.`:`All-phase authorization has not been recorded for this engagement. <button class="btn small-btn" type="button" data-phase="0">01 → Set once in scope &amp; rules</button> You may still document confirmed configuration findings without exploitation.`}</div>
+ ${oac7StageHeader('02','Create a linked test plan','Select a validated in-scope finding once. Its host and evidence flow into the saved record.')}
+ ${list.length?`<form data-oac7-form="plan" class="form-grid"><div class="field full"><label>Validated finding</label><select name="findingId" required>${list.map(f=>`<option value="${e(f.id)}" ${selected?.id===f.id?'selected':''}>${e(f.title)} · ${e(f.host)}${f.autoPort?':'+e(f.autoPort):''}</option>`).join('')}</select></div>
+ <div class="field full"><label>Minimal objective</label><input name="objective" required maxlength="220" placeholder="Validate the observed weakness using only an approved test resource"></div>
+ <div class="field full"><label>Approved method and stop condition</label><textarea name="method" rows="3" maxlength="2000" placeholder="Reference advisory; read-only procedure; time window; stop if unexpected access or impact occurs">${e(oac7Method(selected))}</textarea></div>
+ <div class="actions-row"><button type="submit" class="btn primary">Create test record → Attach evidence</button></div></form>`:oac7Empty('No validated in-scope finding yet. Return to Phase 03 to review scanner evidence or continue to reporting with limitations recorded.')}
+ `,'PLAN + AUTHORIZE')}
+ ${foPanel('Run, import, review — every test stays linked','Expand a test below. Import its output here, choose the accurate outcome, and move to Phase 05. Evidence files are hashed locally.',`
+ ${p.tests.length?p.tests.map(t=>oac7TestCard(p,t)).join(''):oac7Empty('No test records. Create one above only when the finding and scope justify it.')}
+ <div class="actions-row"><button class="btn primary" data-phase="4">05 → Impact & cleanup</button></div>`,'PROOF REGISTER')}`;
+}
+function oac7PostHint(t){if(t.result==='Proof confirmed')return 'Limited access was reported. If access was authorized and remains active in the lab, verify only the effective identity and designated test resource—then close the session and confirm cleanup.';
+ if(t.result==='Configuration verified')return 'No shell/session is required for configuration proof. Describe the security implication and any affected exposure. Mark system access “Not applicable” and cleanup “No changes made” when accurate.';
+ return 'No confirmed access is recorded. Do not run post-exploitation access commands. Record why the test was skipped/inconclusive and verify that no changes remain.';
+}
+function oac7PostCommands(p,t){if(t.result!=='Proof confirmed'||!p.exploitApproved||!isInScope(t.host,p.scope))return '';
+ return `<details class="oac7-safe-commands"><summary>Optional minimum-impact identity checks — only within the already authorized lab session</summary><p class="small">Run inside the authorized existing session, not against a new host. These commands do not gain access.</p><div><span>Linux</span><code>id && whoami && hostname</code><button class="btn small-btn" data-oac7-post-copy="${e(t.id)}" data-oac7-command="id && whoami && hostname">Copy</button></div><div><span>Windows PowerShell</span><code>whoami; hostname</code><button class="btn small-btn" data-oac7-post-copy="${e(t.id)}" data-oac7-command="whoami; hostname">Copy</button></div></details>`;
+}
+function oac7PostCard(p,t){const f=oac7Finding(p,t),r=oac7Post(p,t.id),files=oac7Proof(p,t.id,'post');
+ return `<details class="oac7-test" ${ui.oac7Post===t.id?'open':''}><summary><span><b>${e(f?.title||t.objective)}</b><small>${e(t.host)} · ${e(oac7FieldStatus(t))}</small></span>${oac7Tag(r?'Impact record saved':'Needs impact / closure record',r?.cleanup==='Verified complete'?'ok':'neutral')}</summary><div class="oac7-test-body"><div class="oac7-alert ${t.result==='Proof confirmed'?'good':''}">${e(oac7PostHint(t))}</div>
+ ${oac7PostCommands(p,t)}
+ ${oac7StageHeader('01','Document what access or exposure was actually demonstrated','Choose N/A if this was configuration verification or proof was not established.')}
+ <form data-oac7-form="post" data-oac7-test="${e(t.id)}" class="form-grid">
+ <div class="field"><label>Observed access</label><select name="access"><option value="Not applicable" ${!r||r.access==='Not applicable'?'selected':''}>Not applicable / no access</option><option ${r?.access==='Limited approved access'?'selected':''}>Limited approved access</option><option ${r?.access==='Not determined'?'selected':''}>Not determined</option></select></div>
+ <div class="field"><label>Cleanup status</label><select name="cleanup"><option ${r?.cleanup==='Not assessed'?'selected':''}>Not assessed</option><option ${r?.cleanup==='No changes made'?'selected':''}>No changes made</option><option ${r?.cleanup==='Verified complete'?'selected':''}>Verified complete</option><option ${r?.cleanup==='Follow-up required'?'selected':''}>Follow-up required</option></select></div>
+ <div class="field full"><label>Observed user / role / permission, if applicable</label><input name="role" maxlength="180" value="${e(r?.role||'')}" placeholder="Only a non-sensitive, permitted identity or role; otherwise N/A"></div>
+ <div class="field full"><label>Security impact supported by the test</label><textarea name="impact" required maxlength="2000" rows="3" placeholder="What category of action/data was actually accessible? Or explain why no impact was demonstrated.">${e(r?.impact||'')}</textarea></div>
+ <div class="field full"><label>Actions taken, artifacts created, and restoration checks</label><textarea name="changes" maxlength="1600" rows="2" placeholder="No change; or exactly what you changed and how it was restored">${e(r?.changes||'')}</textarea></div>
+ <div class="field full"><label>Cleanup verification / unresolved issue</label><textarea name="cleanupNotes" maxlength="1600" rows="2" placeholder="Sessions ended, test file removed, snapshot restored, or N/A">${e(r?.cleanupNotes||'')}</textarea></div>
+ <div class="actions-row"><button class="btn primary" type="submit">Save impact + cleanup for this test</button></div>
+ </form>
+ ${oac7StageHeader('02','Attach impact or cleanup evidence','Import one small, sanitized result, or paste the completion/cleanup output.')}
+ ${oac7FileIntake(t.id,'post','Evidence specific to this impact/cleanup record')}
+ ${files.length?files.map(x=>`<div class="oac7-evidence-row">${e(x.filename)} <small>SHA-256 ${e(x.sha.slice(0,22))}…</small></div>`).join(''):oac7Empty('No impact or cleanup evidence attached yet.')}
+ </div></details>`;
+}
+function oac7PostExploit(p){const s=oac7State(p),complete=p.tests.filter(t=>oac7Post(p,t.id)).length;
+ return `${foContext(p)}${foPanel('05 · What did each test prove, and was everything restored?','Each Phase 04 test appears below automatically. You should never need to enter a target or finding again.',`
+ <div class="oac7-metrics">${oac7MiniMetric(p.tests.length,'Linked tests')}${oac7MiniMetric(p.tests.filter(t=>t.result==='Proof confirmed').length,'Human-confirmed proof')}${oac7MiniMetric(complete,'Impact records saved')}${oac7MiniMetric(s.postRecords.filter(x=>x.cleanup==='Verified complete'||x.cleanup==='No changes made').length,'Cleanup closed / N/A')}</div>
+ ${p.tests.length?p.tests.map(t=>oac7PostCard(p,t)).join(''):oac7Empty('No exploitation tests were performed or logged. This is valid: document the scope/limitations in Reporting; do not fabricate impact or post-exploitation.')}
+ <div class="oac7-alert">Proof of a configuration weakness is not proof of remote access. Do not harvest credentials, establish persistence, move to other machines, or inspect private records as part of these guided checks.</div>
+ <div class="actions-row"><button class="btn primary" data-phase="5">06 → Report all evidence</button></div>`,'TEST → IMPACT → CLEANUP')}`;
+}
+function oac7Readiness(p){oac7State(p);const errors=[];
+ if(!p.authorized||!validScope(p.scope))errors.push('Scope/assessment authorization is not recorded.');
+ if(!p.sources.length)errors.push('No imported source files are recorded.');
+ if(p.findings.some(f=>f.status==='suspected'))errors.push('Suspected findings remain unvalidated; label these clearly as unconfirmed.');
+ if(p.tests.some(t=>!oac7Post(p,t.id)))errors.push('Some recorded tests have no linked Phase 05 impact/cleanup record.');
+ if(p.tests.some(t=>t.result==='Proof confirmed'&&!oac7Proof(p,t.id).length))errors.push('At least one confirmed proof test lacks an attached output file or pasted evidence.');
+ if(!String(p.summary||'').trim())errors.push('Executive summary is still blank.');
+ if(!String(p.recommendations||'').trim())errors.push('Recommendations are still blank.');
+ return errors;
+}
+function oac7TraceTable(p){const s=oac7State(p);return p.findings.length?`<div class="oac7-table-wrap"><table class="oac7-report-table"><thead><tr><th>Finding / host</th><th>Phase 03</th><th>Phase 04</th><th>Phase 05</th></tr></thead><tbody>${p.findings.map(f=>{const ss=s.proofFiles;const checks=oac6State(p).scans.filter(x=>x.host===f.host&&(!f.autoPort||Number(x.port)===Number(f.autoPort)));const tests=p.tests.filter(t=>t.findingId===f.id);return `<tr><td><b>${e(f.title)}</b><br>${e(f.host)} · ${e(f.status)}</td><td>${checks.length} correlated check(s)</td><td>${tests.length?tests.map(t=>e(t.result)).join(', '):'Not attempted / not linked'}</td><td>${tests.length?tests.map(t=>e(oac7Post(p,t.id)?.cleanup||'Awaiting closure')).join(', '):'N/A'}</td></tr>`}).join('')}</tbody></table></div>`:oac7Empty('No finding records yet. A no-findings report can still document methodology and testing limitations.');}
+function oac7Report(p){const risks=oac7Readiness(p);
+ return `${foContext(p)}${foPanel('06 · Report completeness — traced through every phase','No copying between phases. The report inherits the imported discovery/verification logs and every linked test, proof file, impact and cleanup record.',`
+ <div class="oac7-metrics">${oac7MiniMetric(p.assets.length,'Observed assets')}${oac7MiniMetric(p.findings.length,'Findings')}${oac7MiniMetric(p.tests.length,'Test records')}${oac7MiniMetric(oac7State(p).proofFiles.length+oac7State(p).postFiles.length,'Proof/cleanup artifacts')}</div>
+ ${risks.length?`<div class="oac7-alert"><strong>Review before delivery (${risks.length}):</strong><ul>${risks.map(x=>`<li>${e(x)}</li>`).join('')}</ul></div>`:`<div class="oac7-alert good"><strong>Completeness checks pass.</strong> Manually verify all technical claims, severity ratings, source authenticity and chain of custody before delivery.</div>`}
+ ${oac7StageHeader('01','Trace every finding into the test and post-test record','An inconclusive, skipped, or configuration-only test is recorded accurately—not upgraded into a successful exploit.')}
+ ${oac7TraceTable(p)}
+ ${oac7StageHeader('02','Evidence register and integrity','File hashes support comparison but do not make the client-side evidence tamper-proof.')}
+ <p class="small">${p.sources.length} imported scan sources; ${oac7State(p).proofFiles.length} linked Phase 04 file(s); ${oac7State(p).postFiles.length} linked Phase 05 file(s).</p>
+ `,'EVIDENCE TRACEABILITY')}
+ ${oac6PreviousReport(p)}`;
+}
+const oac7PreviousPlain=reportPlain;
+reportPlain=function(p){const s=oac7State(p);
+ let str=oac7PreviousPlain(p)+`\n## Phases 04–05 — Finding → proof → impact → cleanup\n`;
+ for(const f of p.findings){const tests=p.tests.filter(t=>t.findingId===f.id);str+=`\n### ${f.title} | ${f.host} | ${f.status}\n`;if(!tests.length){str+='Proof: not attempted / no linked test.\n';continue;}
+ for(const t of tests){const post=oac7Post(p,t.id);str+=`\n- Test ${t.id} (${t.at}): ${t.result}\n  Objective: ${t.objective}\n  Approved method: ${t.method||'not recorded'}\n  Reviewed observation: ${t.evidence||'not recorded'}\n  Imported proof: ${oac7Proof(p,t.id).map(x=>x.filename+' SHA-256 '+x.sha).join('; ')||'none'}\n  Access: ${post?.access||'not assessed'}\n  Role: ${post?.role||'not recorded'}\n  Impact: ${post?.impact||'not assessed'}\n  Changes: ${post?.changes||'not recorded'}\n  Cleanup: ${post?.cleanup||'not assessed'} — ${post?.cleanupNotes||''}\n  Cleanup evidence: ${oac7Proof(p,t.id,'post').map(x=>x.filename+' SHA-256 '+x.sha).join('; ')||'none'}\n`;}}
+ str+=`\n## Final delivery checks\n${oac7Readiness(p).map(x=>'- '+x).join('\n')||'No outstanding automated completeness alerts; manual review still required.'}\n\nThe report represents observations entered by the operator, not independently certified results.\n`;
+ return str;
+};
+const oac7PreviousHTML=reportHTML;
+reportHTML=function(p){const s=oac7State(p);return oac7PreviousHTML(p)+`<div class="report-sheet"><h3>Phase 04–05 — Linked testing, impact and cleanup</h3><table><thead><tr><th>Finding / target</th><th>Observed test result</th><th>Impact and closure</th><th>Evidence</th></tr></thead><tbody>${p.tests.map(t=>{const f=oac7Finding(p,t),post=oac7Post(p,t.id),files=oac7Proof(p,t.id).concat(oac7Proof(p,t.id,'post'));return `<tr><td>${e(f?.title||t.objective)}<br>${e(t.host)}</td><td>${e(t.result)}<br>${e(t.evidence||'No observation recorded')}</td><td>${e(post?.impact||'Not assessed')}<br>Cleanup: ${e(post?.cleanup||'Not assessed')} ${e(post?.cleanupNotes||'')}</td><td>${files.map(x=>`${e(x.filename)}<br>SHA-256 ${e(x.sha)}`).join('<br>')||'No imported evidence'}</td></tr>`}).join('')||'<tr><td colspan="4">No tests recorded; exploitation may have been skipped.</td></tr>'}</tbody></table><h3>Report review alerts</h3><ul>${oac7Readiness(p).map(x=>`<li>${e(x)}</li>`).join('')||'<li>Automated completeness checks passed; independent review remains necessary.</li>'}</ul></div>`;};
+// Activate Phase 04–06 only. Phase 01, 02, and 03 retain their v5/v6 logic.
+exploitation=oac7Exploit;
+postExploit=oac7PostExploit;
+report=oac7Report;
+const oac7OldShell=shell;
+shell=function(p){return oac7OldShell(p).replace('OAC FIELDOPS / v6.0','OAC FIELDOPS / v7.0');};
+const oac7OldAdvice=stepAdvice;
+stepAdvice=function(p){if(ui.phase===3)return `<section class="panel tight"><div class="section-kicker">04 · YOUR NEXT ACTION</div><h3 class="subheading">Select one validated finding, create a permitted proof plan, import the result, and review the outcome.</h3><p class="small">Phase 05 will inherit this specific test. Scanner findings alone cannot be marked successful exploits.</p></section>`;
+if(ui.phase===4)return `<section class="panel tight"><div class="section-kicker">05 · YOUR NEXT ACTION</div><h3 class="subheading">Open a Phase 04 test, record its real impact, import any cleanup evidence, and mark whether restoration was verified.</h3><p class="small">No confirmed access? Do not run access commands. Configuration-only and skipped tests are valid report outcomes.</p></section>`;
+if(ui.phase===5)return `<section class="panel tight"><div class="section-kicker">06 · YOUR NEXT ACTION</div><h3 class="subheading">Resolve report completeness alerts and export the linked assessment.</h3><p class="small">Exported reports include file hashes, proof outcomes, impact and cleanup records; retain originals in secure storage.</p></section>`;return oac7OldAdvice(p)};
+async function oac7SaveFile(p,testId,kind,file){
+ if(!oac7ByTest(p,testId))throw Error('The linked test no longer exists');
+ if(!/\.(txt|xml|log|json|csv|md)$/i.test(file.name))throw Error('Only .txt, .xml, .log, .json, .csv or .md evidence is accepted');
+ if(file.size>2*1024*1024)throw Error('Each evidence file must be 2 MB or less');
+ const s=oac7State(p),bytes=await file.arrayBuffer();const sha=[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(x=>x.toString(16).padStart(2,'0')).join('');
+ const dest=kind==='post'?s.postFiles:s.proofFiles;
+ if(dest.some(x=>x.testId===testId&&x.sha===sha))return false;
+ let excerpt=oac7SafeText(dec.decode(bytes).slice(0,2200),420);
+ const record={id:id(),testId,sha,filename:file.name,bytes:file.size,at:time(),kind,excerpt};
+ dest.unshift(record);if(dest.length>300)dest.length=300;
+ if(!p.sources.some(x=>x.sha===sha))p.sources.unshift({id:id(),name:file.name,size:file.size,sha,at:record.at,count:0,type:`Phase ${kind==='post'?'05':'04'} evidence`});
+ log(p,`Attached ${kind} evidence to test ${testId}: ${file.name}`);return true;
+}
+let oac7Busy=false;
+document.addEventListener('change',ev=>{const el=ev.target;if(!el?.dataset?.oac7File)return;ev.preventDefault();ev.stopImmediatePropagation();
+ const testId=el.dataset.oac7File,kind=el.dataset.oac7Kind,files=[...el.files];if(!files.length)return;if(oac7Busy)return;
+ oac7Busy=true;const p=current();Promise.resolve().then(async()=>{if(!p)throw Error('Unlock a workspace');if(files.length>20)throw Error('Select 20 or fewer files per batch');let n=0;for(const file of files)if(await oac7SaveFile(p,testId,kind,file))n++;await commit(`Imported ${n} Phase ${kind==='post'?'05':'04'} evidence file(s)`);ui.oac7Test=testId;ui.oac7Post=testId;}).catch(fail).finally(()=>{oac7Busy=false;el.value=''});
+},true);
+document.addEventListener('submit',ev=>{const form=ev.target;if(!form?.dataset?.oac7Form)return;ev.preventDefault();ev.stopImmediatePropagation();if(oac7Busy)return;
+ oac7Busy=true;Promise.resolve().then(async()=>{const p=current();if(!p)throw Error('Unlock a workspace');const type=form.dataset.oac7Form,d=Object.fromEntries(new FormData(form)),testId=form.dataset.oac7Test;
+ if(type==='plan'){
+  const f=p.findings.find(x=>x.id===d.findingId);
+  if(!f||f.status!=='validated'||!isInScope(f.host,p.scope)||!scopeSafety(p))throw Error('The test requires a validated finding inside an authorized engagement scope');
+  const objective=String(d.objective||'').trim().slice(0,220),method=String(d.method||'').trim().slice(0,2000);if(!objective||!method)throw Error('Enter a specific objective and approved method/stop condition');
+  const test={id:id(),at:time(),host:f.host,findingId:f.id,objective,method,result:'Not attempted',evidence:'',cleanup:'',f7Created:true};p.tests.unshift(test);ui.oac7Test=test.id;ui.foFinding=f.id;await commit('Created linked controlled test plan');return;
+ }
+ const t=oac7ByTest(p,testId);if(!t)throw Error('The linked test no longer exists');
+ if(type==='paste'){
+  const text=String(d.text||'').trim();if(text.length<8)throw Error('Paste the actual tool output (at least 8 characters)');if(text.length>12000)throw Error('Limit pasted text to 12,000 characters');
+  await oac7SaveFile(p,testId,form.dataset.oac7Kind,new File([text],`${form.dataset.oac7Kind}-terminal-${Date.now()}.txt`,{type:'text/plain'}));ui.oac7Test=t.id;ui.oac7Post=t.id;await commit('Saved pasted evidence for linked test');return;
+ }
+ if(type==='outcome'){
+  const result=String(d.result||''),observation=String(d.evidence||'').trim().slice(0,2500);
+  if(!['Not attempted','Blocked — no authorization','Inconclusive','Not vulnerable','Configuration verified','Proof confirmed'].includes(result))throw Error('Unsupported test result');
+  if(['Proof confirmed','Configuration verified'].includes(result)){
+   const f=oac7Finding(p,t);
+   if(!f||f.status!=='validated'||!scopeSafety(p)||!isInScope(t.host,p.scope))throw Error('A verified result needs a linked validated in-scope finding');
+   if(result==='Proof confirmed'&&!p.exploitApproved)throw Error('Exploit proof cannot be marked confirmed without explicit exploitation approval');
+   if(!d.verified||!observation)throw Error('Review and describe the actual observation before confirming an outcome');
+   if(!oac7Proof(p,t.id).length)throw Error('Attach at least one actual proof output before confirming a result');
+  }
+  Object.assign(t,{result,evidence:observation,method:String(d.method||'').slice(0,2000),atObserved:String(d.atObserved||''),updatedAt:time()});ui.oac7Test=t.id;await commit(`Reviewed proof outcome: ${result}`);return;
+ }
+ if(type==='post'){
+  const access=String(d.access||'Not applicable'),impact=String(d.impact||'').trim().slice(0,2000),cleanup=String(d.cleanup||'Not assessed');
+  if(!impact)throw Error('Describe the observed impact or explain why access was not demonstrated');
+  if(access==='Limited approved access'&&t.result!=='Proof confirmed')throw Error('Do not document approved system access unless Phase 04 has confirmed proof');
+  const record={testId:t.id,at:time(),access,impact,cleanup,role:String(d.role||'').slice(0,180),changes:String(d.changes||'').slice(0,1600),cleanupNotes:String(d.cleanupNotes||'').slice(0,1600)};
+  const s=oac7State(p);const idx=s.postRecords.findIndex(x=>x.testId===t.id);if(idx>=0)s.postRecords[idx]=record;else s.postRecords.unshift(record);ui.oac7Post=t.id;await commit('Saved linked Phase 05 impact and cleanup');return;
+ }
+ }).catch(fail).finally(()=>{oac7Busy=false});
+},true);
+document.addEventListener('click',ev=>{const b=ev.target?.closest?.('[data-oac7-copy],[data-oac7-post-copy]');if(!b)return;ev.preventDefault();ev.stopImmediatePropagation();
+ const p=current(),testId=b.dataset.oac7Copy||b.dataset.oac7PostCopy,t=oac7ByTest(p,testId);
+ if(!t||!scopeSafety(p)||!isInScope(t.host,p.scope))return fail(Error('Authorized scope and linked test required'));
+ if(!p.exploitApproved)return fail(Error('Explicit permission required before copying a Phase 04/05 proof command'));
+ if(b.dataset.oac7Copy&&oac7Finding(p,t)?.status!=='validated')return fail(Error('Validate the linked finding first'));
+ if(b.dataset.oac7PostCopy&&t.result!=='Proof confirmed')return fail(Error('Only record post-access commands for actual confirmed access'));
+ copy(b.dataset.oac7Command||'').catch(fail);
+},true);
+
+/* OAC FieldOps 7.1 — Windows PowerShell / Kali command parity for Phases 03–05.
+ * Appends to the consolidated core. Does not alter Phase 01/02, cryptography,
+ * source hashing, report storage, scope checks or scanner correlation.
+ * Both operating-system selections live in the encrypted engagement data.
+ */
+function oac8OperatorOS(p){foDefaults(p);return p.fieldops.operatorOS==='kali'?'kali':'windows';}
+function oac8SessionOS(p){foDefaults(p);return p.fieldops.targetShell==='linux'?'linux':'windows';}
+function oac8Selector(p,label='Select the laptop running your checks'){
+ const mode=oac8OperatorOS(p);
+ return `<section class="panel oac8-select"><div class="section-kicker">CHOOSE YOUR COMMAND ENVIRONMENT</div><div class="oac8-selector-header"><div><h3>${e(label)}</h3><p class="small">Commands, file locations and copy buttons below use your selected terminal. This setting carries between Phases 03 and 04.</p></div><div class="oac8-options" role="group" aria-label="Command environment"><button type="button" class="btn small-btn ${mode==='windows'?'primary':''}" data-oac8-platform="windows" aria-pressed="${mode==='windows'}">Windows PowerShell</button><button type="button" class="btn small-btn ${mode==='kali'?'primary':''}" data-oac8-platform="kali" aria-pressed="${mode==='kali'}">Kali Linux</button></div></div></section>`;
+}
+function oac8Runbook(p){
+ const win=oac8OperatorOS(p)==='windows';
+ const setup=win?`nmap.exe --version\n$results = Join-Path $HOME 'Documents\\OAC-FieldOps\\Results'\nNew-Item -ItemType Directory -Path $results -Force | Out-Null\nSet-Location $results`:`nmap --version\nmkdir -p "$HOME/Documents/OAC-FieldOps/Results"\ncd "$HOME/Documents/OAC-FieldOps/Results"`;
+ const locate=win?`Get-Location\nGet-ChildItem .\\oac-*.xml`:`pwd\nls -lh oac-*.xml`;
+ return `<section class="panel oac8-runbook"><div class="section-kicker">FIRST-TIME SETUP · ${win?'WINDOWS POWERSHELL':'KALI TERMINAL'}</div><h3>Prepare Nmap and choose a results folder</h3><p class="small">${win?'Install Nmap with Npcap and open Windows PowerShell. For packet-based scans, administrator privileges and Npcap may be needed. Windows Nmap is <code>nmap.exe</code>; PowerShell <code>curl</code> can be an alias, so web checks use <code>curl.exe</code>.':'Run these in Kali Terminal. Use sudo only where required for packet-based probes.'} Save every result in one folder so you can upload it here in Phase 03.</p>
+ <div class="oac8-code-head"><b>1 · Check installation and enter your results folder</b><button class="btn small-btn" data-oac8-copy="${e(setup)}" type="button">Copy setup</button></div><pre class="oac8-pre">${e(setup)}</pre>
+ ${win?`<details class="oac8-help"><summary>What if PowerShell says “nmap.exe is not recognized”?</summary><p class="small">Install it from <a href="https://nmap.org/download.html#windows" target="_blank" rel="noopener noreferrer">Nmap's official Windows download</a> (include Npcap). Restart PowerShell. If Nmap is installed but not on PATH, try <code>&amp; "C:\\Program Files (x86)\\Nmap\\nmap.exe" --version</code>, then fix PATH before using the generated commands.</p></details>`:''}
+ <div class="oac8-code-head"><b>2 · Find your saved XML after each scan</b><button class="btn small-btn" type="button" data-oac8-copy="${e(locate)}">Copy file check</button></div><pre class="oac8-pre">${e(locate)}</pre>
+ <p class="small">3 · Upload the <code>.xml</code> under its exact IP:port task, or use the batch inbox on this same page. You can also paste terminal output. XML has the strongest structured results and works the same on both systems.</p></section>`;
+}
+function oac8NmapForOS(command,platform){
+ let cmd=String(command||'').trim();
+ if(platform!=='windows')return cmd;
+ // Only transform known scan commands, never user-provided arbitrary shell text.
+ cmd=cmd.replace(/^sudo\s+/,'').replace(/^nmap(?=\s)/,'nmap.exe');
+ cmd=cmd.replace(/(\s-oX\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/,(all,flag,dbl,single,bare)=>{
+  const filename=dbl||single||bare;
+  if(!filename||filename==='-'||/^(?:[a-zA-Z]:[\\/]|[\\/]|\.\.?[\\/])/.test(filename))return all;
+  return `${flag}".\\${filename}"`;
+ });
+ return cmd;
+}
+const oac8PreviousInbox=oac6Stage3Inbox;
+oac6Stage3Inbox=function(p){const win=oac8OperatorOS(p)==='windows';return oac8PreviousInbox(p)
+ .replaceAll('Add Kali scan results here','Import Nmap scan results here')
+ .replaceAll('In Kali, select','In your terminal, select')
+ .replaceAll('kali-terminal-','scan-terminal-')
+ .replaceAll('In Kali, XML saved with',win?'In Windows PowerShell, XML saved with':'In Kali, XML saved with')
+ .replaceAll('Open FieldOps in your Kali browser to select the file directly. If you use FieldOps on Windows, transfer the XML to Windows first.',win?'Open FieldOps in your Windows browser and upload the XML from your Results folder.':'Open FieldOps in your Kali browser and upload the XML from your Results folder.');};
+oac6Stage3Queue=function(p){const checks=oac6Expected(p),completed=checks.filter(c=>oac6PendingSummary(p,c)).length;
+ const win=oac8OperatorOS(p)==='windows';
+ const cards=checks.map(c=>{
+  const matched=oac6PendingSummary(p,c);
+  const related=p.findings.filter(f=>f.host===c.host&&Number(f.autoPort)===Number(c.port)&&f.status!=='disproved');
+  const cmd=oac8NmapForOS(c.cmd(c.host,c.port),win?'windows':'kali');
+  return `<div class="oac6-task"><div class="oac6-head"><div><b>${e(c.host)}:${e(c.port)} — ${e(c.name)}</b><div class="small">${e(c.tool)} · ${e(c.service||'Service unverified')}</div></div>${oac6Badge(matched)}</div><p class="small">${e(c.why)}</p>${foCommand(win?'Copy → Run in PowerShell':'Copy → Run in Kali',cmd,c.expect,c.host,p)}<div class="oac6-taskfoot"><label class="btn small-btn" for="oac6-task-${e(c.host.replaceAll('.','-'))}-${e(c.port)}">Upload this check’s XML / text</label><input type="file" id="oac6-task-${e(c.host.replaceAll('.','-'))}-${e(c.port)}" data-oac6-task="${e(oac6Key(c.host,c.port))}" accept=".xml,.txt,.nmap,.gnmap,.log" hidden><span class="small">${matched?`Imported ${e(matched.filename)} · ${e(date(matched.at))}`:'Run the command, then select the XML saved in your Results folder'}</span></div>${matched?`<div class="oac6-result"><b>Observed:</b> ${e(matched.note)}${matched.version?`<div class="small">Product/version: ${e(matched.version)}</div>`:''}${matched.scripts?.length?`<div class="small">NSE script(s): ${e(matched.scripts.join(', '))}</div>`:''}<div class="tiny">Evidence: SHA-256 ${e(matched.sha.slice(0,18))}… · ${e(matched.matchedBy)}</div></div>`:''}${related.length?`<div class="oac6-linked">Linked finding: ${related.map(f=>`<b>${e(f.title)}</b> (${e(f.status)})`).join(', ')} · <button class="btn small-btn" data-phase="3">Review in Phase 04 →</button></div>`:''}</div>`;
+ }).join('');
+ return foPanel(`${win?'Windows PowerShell':'Kali Linux'} investigation queue · ${completed} / ${checks.length} with results`,'Each command targets an observed in-scope open TCP service. After uploading the matching result, FieldOps updates this task and carries supported findings forward.',`${cards||'<div class="empty">No open TCP services have a follow-up check yet. Import your Shark Jack inventory in Phase 02.</div>'}`,'FINDINGS-DRIVEN CHECKLIST');
+};
+vulnerability=function(p){return oac8Selector(p)+oac8Runbook(p)+oac6Vulnerability(p)
+ .replace('Run Kali + import results HERE',`${oac8OperatorOS(p)==='windows'?'Run PowerShell':'Run Kali'} + import results HERE`);};
+function oac8ProofCommand(raw,f,platform){
+ const host=String(f.host||''),port=Number(f.autoPort),kind=String(f.autoKind||'proof').replace(/[^a-z0-9-]/gi,'').slice(0,35);
+ const base=`oac-proof-${host}-${port}-${kind}`;
+ let cmd=String(raw||'').trim();if(!validIPv4(host)||!Number.isInteger(port)||port<1||port>65535)return '';
+ if(/^nmap\s/i.test(cmd)){
+  cmd=oac8NmapForOS(cmd,platform);
+  // Preserve complete machine-readable results from the controlled read-only proof.
+  return `${cmd} -oX ${platform==='windows'?`".\\${base}.xml"`:`"${base}.xml"`}`;
+ }
+ if(/^curl\s/i.test(cmd)){
+  cmd=platform==='windows'?cmd.replace(/^curl\s/,'curl.exe '):cmd;
+  return platform==='windows'?`${cmd} 2>&1 | Tee-Object -FilePath ".\\${base}.txt"`:`${cmd} 2>&1 | tee "${base}.txt"`;
+ }
+ return '';
+}
+oac7Guidance=function(p,t){const f=oac7Finding(p,t),meta=foMethod(f),win=oac8OperatorOS(p)==='windows';
+ const kind=/tls|signing|headers|cipher|security-mode|method/i.test(`${f?.autoKind||''} ${f?.title||''}`);
+ const detail=kind?'This may be a configuration weakness. Confirm the actual setting; do not interpret it as system access.':'Confirm product, affected version, prerequisites, and permission before selecting a minimum-impact proof.';
+ let cmd='';if(meta&&f?.status==='validated'&&p.exploitApproved&&t.findingId===f.id&&isInScope(t.host,p.scope)&&typeof meta.poc==='function'){
+  try{cmd=oac8ProofCommand(meta.poc(f.host,f.autoPort||''),f,win?'windows':'kali')}catch{}
+ }
+ return `<div class="oac7-guidance"><strong>Suggested ${win?'Windows PowerShell':'Kali Linux'} validation</strong><p>${e(detail)}</p><p>${e(meta?.verify||'Review the linked Phase 03 evidence and the vendor advisory first. No universal proof command is available for this finding.')}</p>${cmd?`<div class="oac7-cmd oac8-proof-cmd"><pre>${e(cmd)}</pre><button class="btn small-btn" data-oac7-copy="${e(t.id)}" data-oac7-command="${e(cmd)}">Copy approved read-only check</button></div><p class="small">Run this in your ${win?'Windows PowerShell':'Kali Linux terminal'}, then attach the saved ${/nmap/.test(cmd)?'XML':'text'} file in this exact test's Phase 04 evidence area.</p>`:'<p class="small">A supported automated proof command is not available here. Record the approved manual method and import its actual output; do not guess at an exploit.</p>'}<p class="small">Stop once you have sufficient defensible evidence. Proof outcomes require your explicit review and cannot be inferred from port visibility.</p></div>`;
+};
+exploitation=function(p){return oac8Selector(p,'Which computer will run the controlled proof?')+oac8RunbookForProof(p)+oac7Exploit(p);};
+function oac8RunbookForProof(p){const win=oac8OperatorOS(p)==='windows';return `<section class="panel oac8-mini"><div class="section-kicker">PHASE 04 · ${win?'WINDOWS':'KALI'} EVIDENCE CAPTURE</div><p class="small">${win?'In PowerShell, use <code>nmap.exe</code> (or <code>curl.exe</code>) and run from your writable Results folder set up in Phase 03.':'In Kali, run the suggested command from the Results folder set up in Phase 03.'} The generated supported read-only proof command saves a <code>.xml</code> or <code>.txt</code> file. Attach the result <b>under its specific test</b>. You must still review and record the actual outcome.</p></section>`;}
+function oac8SessionSelector(p){const win=oac8SessionOS(p)==='windows';return `<section class="panel oac8-select"><div class="section-kicker">PHASE 05 · ALREADY AUTHORIZED SESSION</div><div class="oac8-selector-header"><div><h3>What operating system is the target session running?</h3><p class="small">This is the OS inside the <b>existing approved session</b>, not necessarily the OS on your scanning laptop. Only identity checks are offered when Phase 04 proof is confirmed.</p></div><div class="oac8-options" role="group" aria-label="Target session OS"><button class="btn small-btn ${win?'primary':''}" data-oac8-shell="windows" aria-pressed="${win}" type="button">Windows PowerShell</button><button class="btn small-btn ${!win?'primary':''}" data-oac8-shell="linux" aria-pressed="${!win}" type="button">Linux shell</button></div></div></section>`;}
+oac7PostCommands=function(p,t){if(t.result!=='Proof confirmed'||!p.exploitApproved||!isInScope(t.host,p.scope))return '';
+ const win=oac8SessionOS(p)==='windows';
+ const cmd=win?'& { whoami; hostname; Get-Date -Format o } | Tee-Object -FilePath ".\\oac-post-identity.txt"':'{ id; whoami; hostname; date -u +%FT%TZ; } 2>&1 | tee "oac-post-identity.txt"';
+ return `<details class="oac7-safe-commands" open><summary>Read-only ${win?'Windows PowerShell':'Linux'} identity check in the existing approved session</summary><p class="small">Do not use this command to establish access or connect to another host. It only documents the effective identity and hostname after a separately authorized successful proof. It creates an evidence file in the session’s current writable directory—move only the sanitized file to FieldOps in Phase 05.</p><div class="oac8-post-line"><span>${win?'Windows PowerShell':'Linux shell'}</span><pre>${e(cmd)}</pre><button class="btn small-btn" data-oac7-post-copy="${e(t.id)}" data-oac7-command="${e(cmd)}">Copy</button></div></details>`;
+};
+postExploit=function(p){return oac8SessionSelector(p)+oac7PostExploit(p);};
+const oac8EarlierShell=shell;shell=function(p){return oac8EarlierShell(p).replace('OAC FIELDOPS / v7.0','OAC FIELDOPS / v7.1');};
+document.addEventListener('click',ev=>{const b=ev.target?.closest?.('[data-oac8-platform],[data-oac8-shell],[data-oac8-copy]');if(!b)return;ev.preventDefault();ev.stopImmediatePropagation();
+ if(b.dataset.oac8Copy!==undefined){copy(b.dataset.oac8Copy).catch(fail);return;}
+ const p=current();if(!p)return;if(!scopeSafety(p))return fail(Error('Save your authorized assessment scope first'));
+ foDefaults(p);
+ if(b.dataset.oac8Platform){if(!['windows','kali'].includes(b.dataset.oac8Platform))return;p.fieldops.operatorOS=b.dataset.oac8Platform;}
+ if(b.dataset.oac8Shell){if(!['windows','linux'].includes(b.dataset.oac8Shell))return;p.fieldops.targetShell=b.dataset.oac8Shell;}
+ persist().then(()=>render()).catch(fail);
+},true);
+
+/* OAC FieldOps 7.2 — Ordered checks, reliable Windows/Kali output paths,
+ * guided evidence handoffs, and explicit no-findings / skipped-proof paths.
+ * Phase 01 and 02, encrypted persistence, source parsing, scope filtering,
+ * and previous linked evidence models are intentionally unchanged.
+ */
+const OAC9_VERSION='7.2';
+function oac9IsWindows(p){return oac8OperatorOS(p)==='windows';}
+function oac9Stem(c){
+ const raw=String(c.cmd(c.host,c.port)||'');
+ const m=raw.match(/oac-([\w.-]+)\.xml/);
+ const candidate=m?'oac-'+m[1].replace(/\.xml$/,''):`oac-${c.host}-${c.port}-service`;
+ return candidate.replace(/[^\w.-]/g,'').slice(0,115);
+}
+function oac9Paths(p){
+ const win=oac9IsWindows(p);
+ return win?{
+  setup:`$Results = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FieldOps-Loot\\Nmap Results'\nNew-Item -ItemType Directory -Path $Results -Force | Out-Null\nWrite-Host "Saving Nmap scans to: $Results"`,
+  locate:`$Results = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FieldOps-Loot\\Nmap Results'\nGet-ChildItem -LiteralPath $Results -File | Sort-Object LastWriteTime -Descending | Select-Object Name,Length,LastWriteTime\nexplorer.exe "$Results"`,
+  move:`$Results = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FieldOps-Loot\\Nmap Results'\nNew-Item -ItemType Directory -Force -Path $Results | Out-Null\n# Only run this in the folder containing older scan files; move completed results:\nGet-ChildItem -File -Filter 'oac-*' | Where-Object { $_.DirectoryName -ne $Results } | Move-Item -Destination $Results\nexplorer.exe "$Results"`,
+  label:'Windows PowerShell',terminal:'PowerShell',ext:'Windows Nmap with Npcap'
+ }:{
+  setup:'RESULTS="$HOME/Documents/FieldOps-Loot/Nmap Results"\nmkdir -p "$RESULTS"\nprintf "Saving Nmap scans to: %s\\n" "$RESULTS"',
+  locate:'RESULTS="$HOME/Documents/FieldOps-Loot/Nmap Results"\nls -lah "$RESULTS"\nxdg-open "$RESULTS"',
+  move:'RESULTS="$HOME/Documents/FieldOps-Loot/Nmap Results"\nmkdir -p "$RESULTS"\n# Run this from the directory holding older scans:\nfind . -maxdepth 1 -type f -name "oac-*" -exec mv -n -t "$RESULTS" -- {} +\nls -lah "$RESULTS"',
+  label:'Kali Linux',terminal:'Kali terminal',ext:'Nmap (Kali Linux)'
+ };
+}
+function oac9CheckCommand(p,c){
+ const win=oac9IsWindows(p),stem=oac9Stem(c);
+ const raw=String(c.cmd(c.host,c.port)).trim();
+ const cleaned=raw.replace(/^sudo\s+/,'').replace(/^nmap(?=\s)/,win?'nmap.exe':'nmap').replace(/\s-oX\s+(?:"[^"]+"|'[^']+'|\S+)/,'');
+ const pieces=cleaned.split(/\s+/),host=pieces.pop();
+ // The command is generated only from structured in-scope host/port checks.
+ if(!validIPv4(c.host)||host!==c.host||!isInScope(c.host,p.scope))return '';
+ const scan=pieces.join(' ')+' -oA '+(win?'"$OutputBase"':'"$OUTPUT_BASE"')+' '+host;
+ return win?`$Results = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FieldOps-Loot\\Nmap Results'\nNew-Item -ItemType Directory -Path $Results -Force | Out-Null\n$OutputBase = Join-Path $Results '${stem}'\n${scan}\nGet-ChildItem -Path "$OutputBase.*" | Select-Object Name,Length`:
+ `RESULTS="$HOME/Documents/FieldOps-Loot/Nmap Results"\nmkdir -p "$RESULTS"\nOUTPUT_BASE="$RESULTS/${stem}"\n${scan}\nls -lh "$OUTPUT_BASE".*`;
+}
+function oac9Code(title,cmd,note=''){
+ return `<div class="oac9-code"><div class="oac9-code-head"><b>${e(title)}</b><button type="button" class="btn small-btn" data-oac8-copy="${e(cmd)}">Copy</button></div><pre>${e(cmd)}</pre>${note?`<p class="small">${e(note)}</p>`:''}</div>`;
+}
+function oac9Runbook(p){const x=oac9Paths(p),win=oac9IsWindows(p);
+ return `<section class="panel oac9-runbook"><div class="section-kicker">BEFORE RUNNING ANY SCAN · ${win?'WINDOWS POWERSHELL':'KALI'}</div><h3>Save all scan results to the same folder automatically</h3>
+ <p class="small">The results folder is <b>Documents → FieldOps-Loot → Nmap Results</b>. Generated commands create it if needed and save all three Nmap outputs: <code>.xml</code> for import, <code>.nmap</code> for reading, <code>.gnmap</code> for reference. You do <b>not</b> have to enter your Windows username or change directory first.</p>
+ ${oac9Code('Find where earlier scans were saved',win?'Get-Location\nGet-ChildItem -Filter "oac-*" -File':'pwd\nls -lh oac-* 2>/dev/null || true','Earlier scans created with relative filenames are in the directory where the terminal was running.')}
+ <details class="oac9-help"><summary>Already ran scans in the wrong folder? Move them instead of rescanning</summary>${oac9Code('Move older completed oac-* results from your current directory',x.move,'Do not move output while Nmap is still running. These commands work only for files in the current terminal folder.')}</details>
+ <details class="oac9-help"><summary>Open your results folder at any time</summary>${oac9Code('List and open saved results',x.locate)}</details>
+ ${win?'<p class="small">Requirement: <code>nmap.exe</code> from the official Windows Nmap installation (with Npcap). Check with <code>nmap.exe --version</code>. PowerShell commands below must run in PowerShell—not in a Shark Jack SSH shell.</p>':'<p class="small">Commands below run in your Kali terminal. Use the browser on that same computer to import its local XML files, or copy the results to the computer hosting your FieldOps browser.</p>'}</section>`;
+}
+function oac9ProgressLine(p){
+ const tasks=oac6Expected(p),n=tasks.filter(c=>oac6PendingSummary(p,c)).length;
+ const validated=p.findings.filter(f=>f.status==='validated'&&isInScope(f.host,p.scope)).length;
+ return `<div class="oac9-flowline"><span><b>01</b> Choose OS</span><span>→</span><span><b>02</b> Run targeted scan</span><span>→</span><span><b>03</b> Import result</span><span>→</span><span><b>04</b> Review / decide</span></div><p class="small oac9-snapshot">${n} of ${tasks.length} service checks have matching files · ${validated} validated findings can move into Phase 04. An open port or service banner alone never establishes a vulnerability.</p>`;
+}
+function oac9ScanQueue(p){
+ const tasks=oac6Expected(p),win=oac9IsWindows(p),n=tasks.filter(c=>oac6PendingSummary(p,c)).length;
+ let cards='';
+ for(const c of tasks){
+  const matched=oac6PendingSummary(p,c),id=`oac6-task-${c.host.replaceAll('.','-')}-${c.port}`;
+  const related=p.findings.filter(f=>f.host===c.host&&Number(f.autoPort)===Number(c.port)&&f.status!=='disproved');
+  const command=oac9CheckCommand(p,c);
+  cards+=`<article class="oac9-scan-card"><div class="oac6-head"><div><b>${e(c.host)}:${e(c.port)} — ${e(c.name)}</b><p class="small">${e(c.tool)} · ${e(c.why)}</p></div>${oac6Badge(matched)}</div>
+   <div class="oac9-step-title"><span>1</span><b>RUN the command in ${win?'Windows PowerShell':'Kali'}</b></div>
+   ${command?oac9Code('Copy and run this entire block',command):`<div class="oac7-alert">Target no longer matches your recorded authorized scope. No command offered.</div>`}
+   <div class="oac9-step-title"><span>2</span><b>WAIT for Nmap to complete</b></div><p class="small">It saves <code>${e(oac9Stem(c))}.xml</code> plus matching <code>.nmap</code> and <code>.gnmap</code> under <b>Documents → FieldOps-Loot → Nmap Results</b>. If Nmap reports an error or timeout, retain that result for troubleshooting.</p>
+   <div class="oac9-step-title"><span>3</span><b>IMPORT the XML from this specific check</b></div><div class="oac9-import-line"><label class="btn small-btn" for="${e(id)}">Choose the saved XML / text file</label><input id="${e(id)}" type="file" data-oac6-task="${e(oac6Key(c.host,c.port))}" accept=".xml,.txt,.nmap,.gnmap,.log" hidden><span class="small">${matched?'Attached: '+e(matched.filename)+' · '+e(date(matched.at)):'Nothing attached yet'}</span></div>
+   <div class="oac9-step-title"><span>4</span><b>INTERPRET what actually happened</b></div>
+   ${matched?`<div class="oac6-result"><b>Outcome:</b> ${e(matched.outcome)} · ${e(matched.note)}${matched.version?`<p class="small">Detected software: ${e(matched.version)}</p>`:''}${matched.scripts?.length?`<p class="small">NSE scripts: ${e(matched.scripts.join(', '))}</p>`:''}<p class="tiny">SHA-256 ${e(matched.sha)}</p></div>`:`<p class="small">Awaiting evidence. FieldOps will match by the IP and port observed inside the result—not just the filename.</p>`}
+   ${matched?.outcome==='incomplete'?'<div class="oac7-alert">This result is incomplete. Check the Nmap error/timeout, connectivity and scan duration before drawing a conclusion.</div>':''}
+   ${matched?.version?`<div class="oac8-context-note"><b>Next: verify the software build</b><p>Detected version: ${e(matched.version)}. Compare with the router/vendor firmware security advisories and note backported patches. A version string alone is not a confirmed CVE or an exploit path.</p></div>`:''}
+   ${matched?.tlsProtocols?.length?`<div class="oac8-context-note"><b>TLS configuration recorded</b><p>Observed ${e(matched.tlsProtocols.join(', '))}${matched.tlsGrade?' · Nmap least cipher strength '+e(matched.tlsGrade):''}. Review any RSA key-exchange / CBC hardening opportunities against the device policy; do not claim legacy TLS support unless it was observed.</p></div>`:''}
+   ${related.length?`<div class="oac6-linked">Linked finding: ${related.map(f=>`<b>${e(f.title)}</b> (${e(f.status)})`).join(', ')} · <button type="button" class="btn small-btn" data-phase="3">Review in Phase 04 →</button></div>`:'<p class="tiny">No supported vulnerability indicator linked to this check yet. A successful version scan is still useful inventory, not an exploit lead by itself.</p>'}
+  </article>`;
+ }
+ return foPanel(`03 · Run investigations first (${n}/${tasks.length} results received)`,'The upload options are BELOW each command. Work one host/port at a time, or finish several scans and use the batch inbox at the bottom.',cards||`<div class="oac7-alert">There are no observed in-scope open TCP ports to investigate yet. Revisit Phase 02 and import the Shark Jack discovery/service results. Do not invent targets or port states.</div>`,'RUN → IMPORT → REVIEW');
+}
+function oac9BatchInbox(p){const win=oac9IsWindows(p);
+ return foPanel('Already ran several checks? Import their results together','You can add files from different folders in multiple batches, or choose a results folder. FieldOps matches the IP and port in each file and links the observed evidence automatically.',`
+ <div class="oac6-inbox"><div class="oac6-pickrow"><label class="btn small-btn" for="oac6-files">+ Add XML / text files</label><input id="oac6-files" type="file" accept=".xml,.txt,.nmap,.gnmap,.log,.csv" multiple hidden><label class="btn small-btn" for="oac6-folder">+ Add folder</label><input id="oac6-folder" type="file" webkitdirectory directory multiple hidden><button type="button" class="btn small-btn ghost" id="oac6-clear">Clear selection</button></div><div class="oac6-drop" id="oac6-drop">Drag multiple completed Nmap scans or a folder here</div><div id="oac6-queue"><b>0 files selected</b></div><button class="btn primary" type="button" id="oac6-import">Analyze imported results → Update Phases 04–06</button></div>
+ <details class="oac6-paste"><summary>Only have terminal text? Paste a COMPLETE Nmap result instead</summary><p class="small">Include the target IP, PORT/STATE lines, NSE script findings if present, and the <code>Nmap done</code> line. In ${win?'PowerShell use the terminal selection and Ctrl+C (or copy menu)':'Kali Terminal use Ctrl+Shift+C'} to copy output.</p><form id="oac6-paste-form"><label>Real terminal output</label><textarea name="output" required minlength="20" rows="7" placeholder="Nmap scan report for 192.168.50.1&#10;PORT STATE SERVICE&#10;8443/tcp open https-alt&#10;Nmap done: 1 IP address..."></textarea><button class="btn small-btn primary" type="submit">Analyze pasted Nmap output</button></form></details>
+ <p class="small">Prefer <code>.xml</code>. You may import .nmap text as supporting evidence; duplicate hashes are deduplicated. Uploading files never executes the commands. Evidence correlation does not automatically certify a vulnerability.</p>`,'IMPORT AFTER SCANNING');
+}
+function oac9Phase3Interpret(p){const suspected=p.findings.filter(f=>f.status==='suspected'&&isInScope(f.host,p.scope)),validated=p.findings.filter(f=>f.status==='validated'&&isInScope(f.host,p.scope));
+ return `${foPanel('What should happen next?','FieldOps only offers controlled testing when an actual weakness has been validated—not just because port 53, 8443, or 8083 is open.',`<div class="oac9-decision-grid"><div><b>Fingerprint only</b><p class="small">Record the service/version. Check patch and exposure policy. No exploitation suggested from a banner alone.</p></div><div><b>Suspected weakness (${suspected.length})</b><p class="small">Use Review / validate on the linked finding. Check configuration, scope, compensating controls and false positives.</p></div><div><b>Validated (${validated.length})</b><p class="small">Phase 04 becomes available for an approved, limited proof record. Proof is not automatic.</p></div></div>`, 'DECISION GATE')}${oac6FindingPanel(p)}`;
+}
+vulnerability=function(p){return oac8Selector(p,'Where will you run your Nmap checks?')+oac9ProgressLine(p)+oac9Runbook(p)+oac9ScanQueue(p)+oac9BatchInbox(p)+oac9Phase3Interpret(p);};
+function oac9ProofHelp(p){const tested=p.findings.filter(f=>f.status==='validated'&&isInScope(f.host,p.scope));const suspected=p.findings.filter(f=>f.status==='suspected'&&isInScope(f.host,p.scope));
+ return foPanel('Phase 04 · Exactly when to test and what to save','Use a validated weakness inside the single saved engagement authorization. Never assume an open port is exploitable.',`
+ <div class="oac9-steps">${oac7StageHeader('1','SELECT a verified weakness','Phase 03 evidence must actually support the condition. If there are no validated findings, return to Phase 03 or document no exploit performed.')}${oac7StageHeader('2','PLAN the smallest meaningful check','Engagement-wide testing permission carries from Phase 01. Define the host, objective, time and stop conditions for the test record.')}${oac7StageHeader('3','RUN only the displayed evidence-specific check','Read-only Nmap/curl verification is offered for supported finding types. There is no generic “exploit this port” command.')}${oac7StageHeader('4','ATTACH output under the linked test','Choose the saved XML/TXT or paste the actual output—not the command or a verbal summary.')}${oac7StageHeader('5','REVIEW and SAVE the result','Mark Not attempted, Inconclusive, Not vulnerable, Configuration verified, or Proof confirmed as the evidence supports. Continue to Phase 05.')}</div>
+ ${tested.length?`<div class="oac7-alert good">${tested.length} validated finding(s) are eligible for a controlled test plan, under the saved engagement rules.</div>`:`<div class="oac7-alert">There are <b>no validated findings</b> in this engagement. ${suspected.length?`${suspected.length} suspected observation(s) require review first.`:'Your imported scans are informational or did not establish a supported vulnerability.'} <button type="button" class="btn small-btn" data-phase="2">Return to Phase 03</button> A no-exploitation report is a valid outcome.</div>`}
+ `,'CONTROLLED VALIDATION RUNBOOK');
+}
+function oac9ProofSave(p){const x=oac9Paths(p);return `<div class="oac9-storage-help"><p class="small">Phase 04 output belongs in the same <b>Documents → FieldOps-Loot → Nmap Results</b> folder. First run the supported proof command from your linked test below, then attach its saved file under <b>“Attach proof / terminal output to this exact test.”</b></p><details class="oac9-help"><summary>Find saved proof files</summary>${oac9Code('Open your results folder',x.locate)}</details></div>`;}
+const oac9OldProofCommand=oac8ProofCommand;
+oac8ProofCommand=function(raw,f,platform){const host=String(f?.host||''),port=Number(f?.autoPort);if(!validIPv4(host)||!Number.isInteger(port)||port<1||port>65535)return '';
+ const kind=String(f.autoKind||'proof').replace(/[^a-z0-9-]/gi,'').slice(0,32),stem=`oac-proof-${host}-${port}-${kind}`,win=platform==='windows';
+ let cmd=String(raw||'').trim();
+ const pre=win?`$Results = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FieldOps-Loot\\Nmap Results'\nNew-Item -ItemType Directory -Force -Path $Results | Out-Null\n$OutputBase = Join-Path $Results '${stem}'`:`RESULTS="$HOME/Documents/FieldOps-Loot/Nmap Results"\nmkdir -p "$RESULTS"\nOUTPUT_BASE="$RESULTS/${stem}"`;
+ if(/^nmap\s/i.test(cmd)){
+  cmd=cmd.replace(/^nmap\s/,win?'nmap.exe ':'nmap ').replace(/\s-o(?:X|A|N|G)\s+(?:"[^"]+"|'[^']+'|\S+)/g,'');
+  return `${pre}\n${cmd} -oA ${win?'"$OutputBase"':'"$OUTPUT_BASE"'}\n${win?'Get-ChildItem -Path "$OutputBase.*"':'ls -lh "$OUTPUT_BASE".*'}`;
+ }
+ if(/^curl\s/i.test(cmd)){
+  cmd=cmd.replace(/^curl\s/,win?'curl.exe ':'curl ');
+  return win?`${pre}\n${cmd} 2>&1 | Tee-Object -FilePath "$OutputBase.txt"`:`${pre}\n${cmd} 2>&1 | tee "$OUTPUT_BASE.txt"`;
+ }
+ return oac9OldProofCommand(raw,f,platform);
+};
+exploitation=function(p){return oac8Selector(p,'Which laptop will run the approved proof?')+oac9ProofHelp(p)+oac9ProofSave(p)+oac7Exploit(p);};
+function oac9PostHelp(p){const n=p.tests.filter(t=>t.result==='Proof confirmed').length;
+ return foPanel('Phase 05 · What to do after a Phase 04 test','Every saved Phase 04 test is inherited. You do not need to manually re-enter the finding, host or proof result.',`
+ ${oac7StageHeader('1','OPEN the matching Phase 04 test','Each test below has its own impact/cleanup fields and evidence uploader.')}
+ ${oac7StageHeader('2','DOCUMENT demonstrated impact—or that access was not established','Configuration-only or inconclusive checks do not justify target-system commands. If a separately approved session was actually established, the app offers read-only identity checks.')}
+ ${oac7StageHeader('3','SAVE impact and restoration evidence','Import sanitized terminal output or the cleanup checklist under that test. Confirm all test files, accounts and sessions were addressed.')}
+ ${oac7StageHeader('4','GO TO REPORTING','Phase 06 inherits the finding, proof outcome, evidence hash, impact and cleanup notes automatically.')}
+ ${p.tests.length?`<div class="oac7-alert good">${p.tests.length} linked test record(s) available; ${n} with human-confirmed proof.</div>`:'<div class="oac7-alert">No Phase 04 tests are recorded. That is not an error if no vulnerabilities were validated. Continue to Phase 06 and report the assessment scope, evidence and limitations—without inventing post-exploitation activity.</div>'}`,'IMPACT → CLEANUP → REPORT');}
+postExploit=function(p){return oac8SessionSelector(p)+oac9PostHelp(p)+oac7PostExploit(p);};
+const oac9FormerShell=shell;
+shell=function(p){return oac9FormerShell(p).replace('OAC FIELDOPS / v7.1','OAC FIELDOPS / v8.0').replace('OAC FIELDOPS / v7.0','OAC FIELDOPS / v8.0');};
+
+/* Multiple outputs from a single -oA scan can be imported together. Prefer a
+ * complete, structured XML observation to a truncated companion .nmap log,
+ * unless a newer result was collected in a separate later testing window. */
+oac6PendingSummary=function(p,c){
+ const rows=oac6State(p).scans.filter(x=>x.host===c.host&&x.port===Number(c.port)&&x.protocol==='tcp');
+ const score=x=>(x.outcome==='incomplete'?-12:0)+(x.filename?.toLowerCase().endsWith('.xml')?5:0)+(x.scripts?.length?2:0);
+ return rows.sort((a,b)=>{
+  const diff=new Date(b.at).getTime()-new Date(a.at).getTime();
+  if(Number.isFinite(diff)&&Math.abs(diff)>300000)return diff;
+  return score(b)-score(a)||diff||0;
+ })[0]||null;
+};
+
+
+/* FieldOps v8 baseline: one saved authorization per engagement, improved
+ * TLS/version evidence interpretation, Windows/Kali scan-to-report workflow.
+ * Does not bypass in-scope checks or evidence validation. */
+const FIELDOPS_V8 = '8.0';
+const oac8FinalShell = shell;
+shell = function(p){return oac8FinalShell(p).replace(/OAC FIELDOPS \/ v(?:7\.2|7\.1|7\.0)/g,'OAC FIELDOPS / v8.0');};
