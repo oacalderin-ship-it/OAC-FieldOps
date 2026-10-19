@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#0b1015"><meta name="referrer" content="no-referrer"><title>OAC FieldOps v10 · Guided Network Assessment</title><link rel="stylesheet" href="v9.css"><link rel="stylesheet" href="fieldops-v10.css"><link rel="icon" href="favicon.svg" type="image/svg+xml"></head>
+<body>
+<div id="auth" class="auth-screen"></div>
+<div id="shell" class="shell" hidden>
+<aside id="sidebar" class="sidebar"><div class="brand"><div class="monogram">OAC<span>///</span></div><div><strong>FIELDOPS</strong><small>MISSION CONTROL · V10</small></div></div><div class="side-label">GUIDED ASSESSMENT</div><nav id="nav" aria-label="Mission phases">
+<button data-route="overview"><span class="nav-no">⌂</span> Mission overview</button>
+<button data-route="p01"><span class="nav-no">01</span> Scope & authorization</button>
+<button data-route="p02"><span class="nav-no">02</span> Shark Jack & loot</button>
+<button data-route="p03"><span class="nav-no">03</span> Discover hosts</button>
+<button data-route="p04"><span class="nav-no">04</span> Enumerate services</button>
+<button data-route="p05"><span class="nav-no">05</span> Validate weaknesses</button>
+<button data-route="p06"><span class="nav-no">06</span> Proof & impact</button>
+<button data-route="p07"><span class="nav-no">07</span> Report & closure</button>
+</nav><div class="side-label">TOOLS</div><nav><button data-route="evidence"><span class="nav-no">⇪</span> Evidence inbox</button><button data-route="assets"><span class="nav-no">⌘</span> Assets & services</button></nav><div class="sidebar-bottom"><div class="dot"></div><span>AES-GCM encrypted vault · Browser only</span><button data-action="lock" class="sidebar-link">↳ Lock workspace</button><a href="engagement.html" target="_blank" rel="noopener">Engagement authorization form ↗</a></div></aside>
+<div class="body"><header class="top"><div class="crumb"><button id="mobileNav" class="iconbtn" type="button" aria-label="Toggle navigation">☰</button><span>OAC / FIELDOPS / <strong id="crumb">MISSION OVERVIEW</strong></span></div><div class="top-actions"><span class="version">ENGINE v10.0</span><button type="button" class="btn ghost" data-action="backup">↧ Encrypted backup</button><button type="button" class="btn danger" data-action="reset">↺ Reset</button><button type="button" class="btn primary" data-action="pick">+ Import loot</button></div></header><main id="main" class="main" tabindex="-1"></main><div id="toast" role="status" aria-live="polite"></div></div></div>
+<input id="files" hidden type="file" multiple accept=".xml,.txt,.nmap,.gnmap,.log,.html,.json,.zip,.csv">
+<input id="restore" hidden type="file" accept=".json,application/json">
+<script src="fieldops-core.js"></script><script src="fieldops-v10-engine.js"></script><script src="fieldops-v10.js"></script>
+</body></html>
