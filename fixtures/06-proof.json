@@ -1,0 +1,8 @@
+{
+  "format": "oac-proof-v1",
+  "host": "10.10.10.1",
+  "port": 21,
+  "investigationId": "10.10.10.1:tcp:21:ftp",
+  "stage": "attempt",
+  "transcript": "< 230 Login successful.\n< 221 Goodbye."
+}

@@ -1,0 +1,1 @@
+{"name":"oac-fieldops","version":"11.0.0-rc.1","private":true,"type":"module","scripts":{"test":"node --test tests/*.test.mjs","check":"node --check js/app.js"},"engines":{"node":">=22"}}

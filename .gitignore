@@ -1,14 +1,6 @@
-# NEVER publish evidence, private exports, local secrets, or backups.
-*encrypted-backup*.json
-*-report.html
-*-report.md
-*.pcap
-*.pcapng
-*.gnmap
-*.nmap
-*.log
-loot/
-evidence/
-private/
-.env
-.env.*
+node_modules/
+test-artifacts/
+*.backup.json
+*encrypted-backup*
+*PLAINTEXT*
+.DS_Store

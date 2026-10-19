@@ -1,0 +1,268 @@
+TAP version 13
+# Subtest: Scope: IPv4 CIDR, exclusions, boundaries and /0 arithmetic
+ok 1 - Scope: IPv4 CIDR, exclusions, boundaries and /0 arithmetic
+  ---
+  duration_ms: 6.137565
+  type: 'test'
+  ...
+# Subtest: Scope: reject injection, invalid IP, hostname and malformed prefix
+ok 2 - Scope: reject injection, invalid IP, hostname and malformed prefix
+  ---
+  duration_ms: 0.287382
+  type: 'test'
+  ...
+# Subtest: Scope: missing consent and expired window block generation
+ok 3 - Scope: missing consent and expired window block generation
+  ---
+  duration_ms: 0.293021
+  type: 'test'
+  ...
+# Subtest: A: DNS Cloudflare fingerprint is not firmware or vulnerability
+ok 4 - A: DNS Cloudflare fingerprint is not firmware or vulnerability
+  ---
+  duration_ms: 9.053944
+  type: 'test'
+  ...
+# Subtest: B: lighttpd old banner generates HTTP check, no fabricated CVE
+ok 5 - B: lighttpd old banner generates HTTP check, no fabricated CVE
+  ---
+  duration_ms: 2.481784
+  type: 'test'
+  ...
+# Subtest: C: weak TLS produces supported configuration finding
+ok 6 - C: weak TLS produces supported configuration finding
+  ---
+  duration_ms: 1.055859
+  type: 'test'
+  ...
+# Subtest: C: strong TLS negative is scoped to this check
+ok 7 - C: strong TLS negative is scoped to this check
+  ---
+  duration_ms: 0.231308
+  type: 'test'
+  ...
+# Subtest: C: TLS error or absent evidence remains inconclusive
+ok 8 - C: TLS error or absent evidence remains inconclusive
+  ---
+  duration_ms: 0.176806
+  type: 'test'
+  ...
+# Subtest: D: RPC and Hyper-V guesses create distinct checks without vulnerabilities
+ok 9 - D: RPC and Hyper-V guesses create distinct checks without vulnerabilities
+  ---
+  duration_ms: 1.037542
+  type: 'test'
+  ...
+# Subtest: E: completed clean scan yields no fabricated findings and honest report
+ok 10 - E: completed clean scan yields no fabricated findings and honest report
+  ---
+  duration_ms: 1.330742
+  type: 'test'
+  ...
+# Subtest: F: XML completion independent of companion text marker
+ok 11 - F: XML completion independent of companion text marker
+  ---
+  duration_ms: 1.411834
+  type: 'test'
+  ...
+# Subtest: G: Windows transfer uses legacy SCP, not loot/.; checks exit code and files
+ok 12 - G: Windows transfer uses legacy SCP, not loot/.; checks exit code and files
+  ---
+  duration_ms: 0.420633
+  type: 'test'
+  ...
+# Subtest: G: Kali transfer mock succeeds with real output and fails on empty destination
+ok 13 - G: Kali transfer mock succeeds with real output and fails on empty destination
+  ---
+  duration_ms: 21.298799
+  type: 'test'
+  ...
+# Subtest: G: source spaces and destination quote are shell-quoted; path injection rejected
+ok 14 - G: source spaces and destination quote are shell-quoted; path injection rejected
+  ---
+  duration_ms: 2.758872
+  type: 'test'
+  ...
+# Subtest: H: Windows Nmap fallback uses call operator and checks exit status
+ok 15 - H: Windows Nmap fallback uses call operator and checks exit status
+  ---
+  duration_ms: 0.204087
+  type: 'test'
+  ...
+# Subtest: I: incomplete scan never confirms weakness
+ok 16 - I: incomplete scan never confirms weakness
+  ---
+  duration_ms: 2.008242
+  type: 'test'
+  ...
+# Subtest: I: truncated XML retained with parsing failure
+ok 17 - I: truncated XML retained with parsing failure
+  ---
+  duration_ms: 0.441304
+  type: 'test'
+  ...
+# Subtest: J: SMB1 positive and required signing negative remain separate
+ok 18 - J: SMB1 positive and required signing negative remain separate
+  ---
+  duration_ms: 0.939193
+  type: 'test'
+  ...
+# Subtest: K: proof distinguishes attempt failure, session, identity and cleanup
+ok 19 - K: proof distinguishes attempt failure, session, identity and cleanup
+  ---
+  duration_ms: 1.820549
+  type: 'test'
+  ...
+# Subtest: L: cross-host and cross-port isolation
+ok 20 - L: cross-host and cross-port isolation
+  ---
+  duration_ms: 1.401409
+  type: 'test'
+  ...
+# Subtest: L: mismatched proof is rejected from conclusions
+ok 21 - L: mismatched proof is rejected from conclusions
+  ---
+  duration_ms: 1.345615
+  type: 'test'
+  ...
+# Subtest: M: encrypt, serialize/reload, unlock, backup restore and wrong password
+ok 22 - M: encrypt, serialize/reload, unlock, backup restore and wrong password
+  ---
+  duration_ms: 331.084928
+  type: 'test'
+  ...
+# Subtest: M: tamper detection and unsupported schema
+ok 23 - M: tamper detection and unsupported schema
+  ---
+  duration_ms: 166.91873
+  type: 'test'
+  ...
+# Subtest: N: empty assessment has no invented assets and useful report
+ok 24 - N: empty assessment has no invented assets and useful report
+  ---
+  duration_ms: 0.433773
+  type: 'test'
+  ...
+# Subtest: O: bulk imports deduplicate by content and preserve original bytes
+ok 25 - O: bulk imports deduplicate by content and preserve original bytes
+  ---
+  duration_ms: 5.901551
+  type: 'test'
+  ...
+# Subtest: Format recognition: misleading suffix, host list, grepable, CSV, HTML and ping
+ok 26 - Format recognition: misleading suffix, host list, grepable, CSV, HTML and ping
+  ---
+  duration_ms: 1.597564
+  type: 'test'
+  ...
+# Subtest: Nmap text scripts remain attached to right endpoint
+ok 27 - Nmap text scripts remain attached to right endpoint
+  ---
+  duration_ms: 0.231338
+  type: 'test'
+  ...
+# Subtest: Untrusted strings escaped in report; XML entities not executed
+ok 28 - Untrusted strings escaped in report; XML entities not executed
+  ---
+  duration_ms: 0.782918
+  type: 'test'
+  ...
+# Subtest: Imported JSON cannot assert arbitrary vulnerability flags
+ok 29 - Imported JSON cannot assert arbitrary vulnerability flags
+  ---
+  duration_ms: 0.295034
+  type: 'test'
+  ...
+# Subtest: Intensity gate blocks TLS cipher checks at low intensity
+ok 30 - Intensity gate blocks TLS cipher checks at low intensity
+  ---
+  duration_ms: 0.132129
+  type: 'test'
+  ...
+# Subtest: Protocol routing includes SMTP/database/unknown and UDP
+ok 31 - Protocol routing includes SMTP/database/unknown and UDP
+  ---
+  duration_ms: 0.212791
+  type: 'test'
+  ...
+# Subtest: Generated Kali commands parse as shell syntax
+ok 32 - Generated Kali commands parse as shell syntax
+  ---
+  duration_ms: 15.034433
+  type: 'test'
+  ...
+# Subtest: ZIP valid stored entry, zip slip, count and corrupt inputs
+ok 33 - ZIP valid stored entry, zip slip, count and corrupt inputs
+  ---
+  duration_ms: 4.629957
+  type: 'test'
+  ...
+# Subtest: Evidence size guard rejects oversized file
+ok 34 - Evidence size guard rejects oversized file
+  ---
+  duration_ms: 2.529792
+  type: 'test'
+  ...
+# Subtest: Completed task does not remain in recommended next action
+ok 35 - Completed task does not remain in recommended next action
+  ---
+  duration_ms: 3.557814
+  type: 'test'
+  ...
+# Subtest: Discovery never generates command for range overlapping exclusion
+ok 36 - Discovery never generates command for range overlapping exclusion
+  ---
+  duration_ms: 0.29256
+  type: 'test'
+  ...
+# Subtest: Transfer archive fallback checks tar and avoids binary PowerShell redirection
+ok 37 - Transfer archive fallback checks tar and avoids binary PowerShell redirection
+  ---
+  duration_ms: 0.190807
+  type: 'test'
+  ...
+# Subtest: Command generator rejects invalid ports even if called outside UI
+ok 38 - Command generator rejects invalid ports even if called outside UI
+  ---
+  duration_ms: 0.210807
+  type: 'test'
+  ...
+# Subtest: Workspace size check preserves duplicates but rejects new oversized import
+ok 39 - Workspace size check preserves duplicates but rejects new oversized import
+  ---
+  duration_ms: 1.107776
+  type: 'test'
+  ...
+# Subtest: Invalid start timestamp cannot bypass the testing window
+ok 40 - Invalid start timestamp cannot bypass the testing window
+  ---
+  duration_ms: 0.29888
+  type: 'test'
+  ...
+# Subtest: Full engine journey: vault → scope → collected fixtures → decisions → proof → report → recovery
+ok 41 - Full engine journey: vault → scope → collected fixtures → decisions → proof → report → recovery
+  ---
+  duration_ms: 182.758621
+  type: 'test'
+  ...
+# Subtest: ZIP deflate decompression is exercised
+ok 42 - ZIP deflate decompression is exercised
+  ---
+  duration_ms: 9.31784
+  type: 'test'
+  ...
+# Subtest: SMB host scripts with ambiguous port provenance are not attached to a port
+ok 43 - SMB host scripts with ambiguous port provenance are not attached to a port
+  ---
+  duration_ms: 1.399706
+  type: 'test'
+  ...
+1..43
+# tests 43
+# suites 0
+# pass 43
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 669.89667

@@ -1,0 +1,21 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import {create,open,seal} from '../js/crypto.js';
+import {importBytes} from '../js/evidence.js';
+import {analyze} from '../js/engine.js';
+import {scanCommand,transferCommand} from '../js/commands.js';
+import {reportHTML,reportMarkdown} from '../js/report.js';
+import {unzip} from '../js/zip.js';
+test('Full engine journey: vault → scope → collected fixtures → decisions → proof → report → recovery',async()=>{
+ const e={id:'fictional',name:'Fictional authorized lab',owner:'Example owner',assessor:'Example assessor',type:'Personal lab',scope:'10.10.10.0/24',exclude:'',start:'2020-01-01T00:00:00Z',end:'2099-12-31T23:59:59Z',consent:true,consentAt:new Date().toISOString(),exploitation:true,intensity:'standard',evidence:[],commandHistory:[]};
+ let state={schema:1,engagements:[e]};const vault=await create('fictional-test-passphrase',state);
+ const transfer=transferCommand({ip:'10.10.10.1',platform:'windows',destination:'C:\\Lab Evidence'});assert.match(transfer,/scp.exe -O/);
+ for(const name of ['01-discovery.txt','02-router-services.xml','04-windows-services.xml'])await importBytes(name,new Uint8Array(await readFile(new URL('../fixtures/'+name,import.meta.url))),e);
+ let a=analyze(e);assert.equal(a.assets.length,2);assert.equal(a.findings.length,0);assert(a.next);assert.match(scanCommand(a.tasks.find(t=>t.type==='tls'),e).command,/ssl-enum-ciphers/);
+ for(const name of ['03-tls-weak.xml','05-ftp-anonymous.xml','06-proof.json'])await importBytes(name,new Uint8Array(await readFile(new URL('../fixtures/'+name,import.meta.url))),e);
+ a=analyze(e);assert(a.findings.some(x=>x.state==='Verified vulnerable configuration'));assert.equal(a.proofs[0].outcome,'Controlled access demonstrated');assert(a.tasks.some(t=>t.state==='Awaiting evidence'));assert.match(reportHTML(e),/Anonymous FTP access accepted/);assert.match(reportMarkdown(e),/Obsolete TLS/);
+ const saved=await seal(state,vault.key,vault.salt);state=null;const restored=await open(JSON.parse(JSON.stringify(saved)),'fictional-test-passphrase');assert.equal(restored.data.engagements[0].evidence.length,6);assert.equal(analyze(restored.data.engagements[0]).findings.length,2);
+});
+test('ZIP deflate decompression is exercised',async()=>{const bytes=new Uint8Array(await readFile(new URL('../fixtures/deflated-evidence.zip',import.meta.url)));const items=await unzip(bytes);assert.equal(items.length,1);assert.match(new TextDecoder().decode(items[0].bytes),/nmaprun/);});
+test('SMB host scripts with ambiguous port provenance are not attached to a port',async()=>{const e={id:'lab',name:'lab',owner:'owner',assessor:'assessor',scope:'10.10.10.0/24',exclude:'',start:'2020-01-01',end:'2099-01-01',consent:true,evidence:[]};const s='<nmaprun args="nmap -sV"><host><address addr="10.10.10.1" addrtype="ipv4"/><ports><port protocol="tcp" portid="139"><state state="open"/><service name="netbios-ssn"/></port></ports><hostscript><script id="smb-protocols" output="NT LM 0.12 (SMBv1)"/></hostscript></host><runstats><finished exit="success"/></runstats></nmaprun>';await importBytes('ambiguous.xml',new TextEncoder().encode(s),e);assert.equal(analyze(e).findings.length,0);});

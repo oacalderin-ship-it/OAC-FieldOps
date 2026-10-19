@@ -1,0 +1,9 @@
+export function ipNumber(ip) {
+ if(typeof ip!=='string'||!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) throw Error('Use a literal IPv4 address; hostnames and IPv6 are not supported in this release.');
+ const p=ip.split('.');if(p.some(x=>+x>255||(x.length>1&&x[0]==='0')))throw Error('Invalid IPv4 address.');return p.reduce((a,b)=>a*256+ +b,0);
+}
+export function range(s){const p=s.trim().split('/');if(p.length>2)throw Error('Invalid CIDR');const n=ipNumber(p[0]);const bits=p.length===1?32:Number(p[1]);if(!/^\d+$/.test(p[1]??'32')||bits<0||bits>32)throw Error('CIDR prefix must be 0–32');const size=2**(32-bits);return [Math.floor(n/size)*size,Math.floor(n/size)*size+size-1];}
+export const entries=s=>String(s||'').split(/[\s,;]+/).filter(Boolean);
+export function validateEngagement(e){if(!e.name?.trim()||!e.owner?.trim()||!e.assessor?.trim())throw Error('Name, owner and assessor are required.');if(!e.consent)throw Error('Record authorization before generating tests.');if(!entries(e.scope).length)throw Error('Add at least one authorized IPv4 address or CIDR.');[...entries(e.scope),...entries(e.exclude)].forEach(range);if(!e.start||!e.end||Date.parse(e.start)>Date.parse(e.end)||!Number.isFinite(Date.parse(e.end))||!Number.isFinite(Date.parse(e.start)))throw Error('Enter a valid testing window.');return true;}
+export function allowed(target,e,now=Date.now()){try{validateEngagement(e);const [a,b]=range(target);if(now<Date.parse(e.start)||now>Date.parse(e.end))return false;return entries(e.scope).some(s=>{const [x,y]=range(s);return a>=x&&b<=y;})&&!entries(e.exclude).some(s=>{const[x,y]=range(s);return a<=y&&b>=x;});}catch{return false;}}
+export function assertAllowed(target,e){if(!allowed(target,e))throw Error('Command blocked: target overlaps exclusions, is outside scope, or authorization/testing window is missing or expired.');}
